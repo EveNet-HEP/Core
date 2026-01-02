@@ -8,7 +8,7 @@ from evenet.network.layers.linear_block import create_linear_block
 from evenet.network.layers.transformer import TransformerBlockModule
 from evenet.network.layers.utils import RandomDrop
 import torch
-
+from evenet.network.body.adapter import Adapter
 
 class EmbeddingStack(nn.Module):
     def __init__(self, linear_block_type: str,
@@ -263,7 +263,7 @@ class PETBody(nn.Module):
     def __init__(
             self, num_feat, num_keep, feature_drop, projection_dim, local, K, num_local,
             num_layers, num_heads, drop_probability, talking_head, layer_scale,
-            layer_scale_init, dropout, mode
+            layer_scale_init, dropout, mode, use_adapter: bool = False
     ):
         super().__init__()
         self.num_keep = num_keep
@@ -299,6 +299,14 @@ class PETBody(nn.Module):
             )
             for _ in range(num_layers)
         ])
+
+        self.use_adapter = use_adapter
+        if self.use_adapter:
+            self.adapters = nn.ModuleList([
+                Adapter(projection_dim, bottleneck=16, dropout=dropout)
+                for _ in range(num_layers)
+            ])
+
 
     def forward(self,
                 input_features: Tensor,
@@ -342,12 +350,16 @@ class PETBody(nn.Module):
             encoded = local_features + encoded  # Combine with original features
 
         skip_connection = encoded
-        for transformer_block in self.transformer_blocks:
+        for itransformer, transformer_block in enumerate(self.transformer_blocks):
             encoded = transformer_block(
                 x=encoded,
                 mask=mask,
                 attn_mask=attn_mask
             )
+            if self.use_adapter:
+                encoded = self.adapters[itransformer](encoded)
+                encoded = encoded * mask.float()
+
 
         return torch.add(encoded, skip_connection)
 
