@@ -13,7 +13,7 @@ def discover_packages() -> list[str]:
 
 setup(
     name="evenet-core",
-    version="0.2.0",
+    version="0.3.0",
     description="Core components for EveNet models.",
     long_description=(ROOT / "README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",
@@ -26,7 +26,7 @@ setup(
     install_requires=[
         "lightning>=2.0",
         "matplotlib>=3.7",
-        "numpy>=1.24",
+        "numpy==1.26.4",
         "opt-einsum>=3.3",
         "pyarrow>=14.0",
         "pyyaml>=6.0",
