@@ -1,6 +1,6 @@
-# Releasing `event-core`
+# Releasing `evenet-core`
 
-This repository publishes only `event-core`.
+This repository publishes only `evenet-core`.
 
 ## Auto publish flow
 
@@ -12,12 +12,12 @@ No separate manual publish workflow is required.
 
 ## What you must set on PyPI
 
-Set up **Trusted Publishing** for package `event-core`:
+Set up **Trusted Publishing** for package `evenet-core`:
 
-1. Package name: `event-core` (create it if it does not exist yet).
+1. Package name: `evenet-core` (create it if it does not exist yet).
 2. Publisher type: GitHub Actions.
 3. GitHub owner: your org/user.
-4. GitHub repository: your `event-core` repository.
+4. GitHub repository: your `evenet-core` repository.
 5. Workflow filename: `build-core.yml`.
 6. Environment name: `pypi`.
 

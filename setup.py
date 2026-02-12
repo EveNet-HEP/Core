@@ -12,7 +12,7 @@ def discover_packages() -> list[str]:
 
 
 setup(
-    name="event-core",
+    name="evenet-core",
     version="0.1.0",
     description="Core components for EveNet models.",
     long_description=(ROOT / "README.md").read_text(encoding="utf-8"),

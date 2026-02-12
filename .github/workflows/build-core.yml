@@ -1,4 +1,4 @@
-name: Build and Publish event-core
+name: Build and Publish evenet-core
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build-core:
-    name: Build event-core
+    name: Build evenet-core
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -25,7 +25,7 @@ jobs:
       - name: Install build tools
         run: python -m pip install --upgrade build twine
 
-      - name: Build event-core
+      - name: Build evenet-core
         run: python -m build
 
       - name: Validate artifacts
@@ -34,11 +34,11 @@ jobs:
       - name: Upload dist
         uses: actions/upload-artifact@v4
         with:
-          name: event-core-dist
+          name: evenet-core-dist
           path: dist/*
 
   publish-core:
-    name: Publish event-core to PyPI
+    name: Publish evenet-core to PyPI
     needs: build-core
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
@@ -50,7 +50,7 @@ jobs:
       - name: Download dist artifact
         uses: actions/download-artifact@v4
         with:
-          name: event-core-dist
+          name: evenet-core-dist
           path: dist
 
       - name: Publish to PyPI (Trusted Publishing)
