@@ -35,7 +35,7 @@ setup(
         "scipy>=1.10",
         "sympy>=1.12",
         "torch>=2.1",
-        "torch-linear-assignment>=0.0.5",
+        # "torch-linear-assignment>=0.0.5",
         "tqdm>=4.65",
         "wandb>=0.16",
     ],
