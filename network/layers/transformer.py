@@ -1,6 +1,7 @@
 import torch.nn as nn
 from torch import Tensor
 import torch
+import torch.nn.functional as F
 
 from evenet.network.layers.utils import TalkingHeadAttention, StochasticDepth, LayerScale
 from evenet.network.layers.linear_block import GRUGate, GRUBlock
@@ -8,9 +9,183 @@ from evenet.network.layers.activation import create_residual_connection
 
 from typing import Optional
 
+class Gate(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_experts: int,
+        select_top_k: int,
+        use_router_noise: bool
+    ) -> None:
+        super().__init__()
+        self.router = nn.Linear(embed_dim, num_experts, bias=False)
+        self.noise_router = nn.Linear(embed_dim, num_experts, bias=False) if use_router_noise else None
+        self.select_top_k = select_top_k
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        router_logits = self.router(x)
+        noisy_router_logits = router_logits
+
+        # noisy top-k routing during training to keep exploration healthy
+        if self.training and self.noise_router is not None:
+            noise_std = F.softplus(self.noise_router(x))
+            noisy_router_logits = noisy_router_logits + torch.randn_like(noisy_router_logits) * noise_std
+
+        # get top-k expert scores per object
+        topk_logits, topk_indices = torch.topk(noisy_router_logits, self.select_top_k, dim=-1)
+        # probability distribution over selected experts only
+        topk_weights = torch.softmax(topk_logits, dim=-1)
+
+        # dense gate weights over all experts from clean logits; used for losses/stats
+        dense_gate_weights = torch.softmax(router_logits, dim=-1)
+
+        return router_logits, dense_gate_weights, topk_weights, topk_indices
+
+
+class Expert(nn.Module):
+    def __init__(self, embed_dim: int, feedforward_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, feedforward_dim),
+            # GELU activation maintained from original PET FFN
+            nn.GELU(approximate="none"),
+            nn.Dropout(dropout),
+            nn.Linear(feedforward_dim, embed_dim),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.ffn(x)
+
+
+class MoE(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        feedforward_dim: int,
+        base_num_experts: int,
+        base_select_top_k: int,
+        num_shared_experts: int,
+        expert_segmentation_factor: int,
+        scale_expert_dim: bool,
+        alpha: float,
+        c_z: float,
+        use_router_noise: bool,
+        dropout: float
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.base_num_experts = base_num_experts
+        self.base_select_top_k = base_select_top_k
+        self.expert_segmentation_factor = expert_segmentation_factor
+        self.num_shared_experts = num_shared_experts
+        self.alpha = alpha
+        self.c_z = c_z
+
+        total_experts = self.base_num_experts * self.expert_segmentation_factor
+        # num_experts is the total budget - routed experts fill the remainder after reserving shared slots
+        self.num_experts = total_experts - num_shared_experts
+        self.select_top_k = self.base_select_top_k * self.expert_segmentation_factor
+        # when scale_expert_dim is True divide each expert's hidden dim by select_top_k to keep per-token compute constant vs. a vanilla FFN
+        # note: even shared experts are being impacted by segmentation scaling of k
+        self.expert_hidden_dim = int(feedforward_dim / (self.select_top_k + self.num_shared_experts)) if scale_expert_dim else feedforward_dim
+
+        self.gate = Gate(embed_dim, self.num_experts, self.select_top_k, use_router_noise=use_router_noise)
+        self.routed_experts = nn.ModuleList([
+                Expert(embed_dim, self.expert_hidden_dim, dropout)
+                for _ in range(self.num_experts)
+        ])
+        self.shared_experts = nn.ModuleList([
+                Expert(embed_dim, self.expert_hidden_dim, dropout)
+                for _ in range(self.num_shared_experts)
+        ])
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        original_shape = x.shape
+        # print(f"[MoE] forward pass received objects shape={tuple(original_shape)}")
+        # collapse batch/object axes to a 2D tensor so that each row corresponds to a single object to route to experts
+        x = x.reshape(-1, x.shape[-1])
+        num_objects = x.shape[0]
+
+        router_logits, dense_gate_weights, topk_weights, topk_indices = self.gate(x)
+
+        routed_output = torch.zeros((num_objects, self.embed_dim), dtype=x.dtype, device=x.device)
+        objects_per_expert = torch.zeros(self.num_experts, dtype=torch.long, device=x.device)
+
+        if num_objects > 0:
+            # get flat list of each object id repeated for each of its top-k experts - e.g., [0, 0, 1, 1, 2, 2, ...]
+            object_indices = torch.arange(num_objects, device=x.device).unsqueeze(1).expand(-1, self.select_top_k).reshape(-1)
+            # get flat list of which expert each object is assigned to - of size [num_objects * top_k]
+            expert_indices = topk_indices.reshape(-1)
+            # get flat list of corresponding expert weights for each object - of size [num_objects * top_k]
+            expert_weights = topk_weights.reshape(-1)
+
+            # sort by expert index so that all objects for each expert are grouped together
+            order = torch.argsort(expert_indices)
+            # update to be in sorted order by expert index
+            object_indices = object_indices[order]
+            expert_indices = expert_indices[order]
+            expert_weights = expert_weights[order]
+            # count how many objects are assigned to each expert to know how to split the input tensor for each expert's forward pass
+            objects_per_expert = torch.bincount(expert_indices, minlength=self.num_experts)
+
+            cursor = 0
+            # iterate through each expert's assigned objects in order of expert index
+            for expert_id, count in enumerate(objects_per_expert.tolist()):
+                if count == 0:
+                    continue
+                end = cursor + count
+
+                # create minibatch if all objects assigned to the current expert
+                current_object_indices = object_indices[cursor:end]
+                current_inputs = x.index_select(0, current_object_indices)
+
+                # forward pass through the current expert with created minibatch
+                current_outputs = self.routed_experts[expert_id](current_inputs)
+                # get the corresponding expert weights for the current expert's assigned objects
+                current_weights = expert_weights[cursor:end].unsqueeze(-1)
+
+                # weight the expert outputs by the corresponding expert weights for each object,
+                # then add to the correct rows of the final output tensor using the object indices
+                routed_output.index_add_(0, current_object_indices, current_outputs * current_weights)
+
+                cursor = end
+
+        # as shared experts are not part of the routing decisions,
+        # run all objects through all shared experts and add to the final output
+        if self.num_shared_experts > 0:
+            shared_output = torch.zeros_like(routed_output)
+            for shared_expert in self.shared_experts:
+                shared_output = shared_output + shared_expert(x)
+            final_output = routed_output + shared_output
+        else:
+            final_output = routed_output
+
+        # fi - proportion of objects assigned to each expert
+        denom = max(num_objects * self.select_top_k, 1)
+        dispatch_fraction = objects_per_expert.to(dtype=dense_gate_weights.dtype) / denom
+        # pi - average probability of each expert being selected across all objects
+        mean_router_prob = dense_gate_weights.mean(dim=0) if num_objects > 0 else torch.zeros_like(dispatch_fraction)
+        # l_aux is the sum across experts of fi * pi, scaled by alpha and num_experts
+        l_aux = self.alpha * self.num_experts * torch.sum(dispatch_fraction * mean_router_prob)
+
+        if num_objects > 0:
+            # use clean router logits without noise (pre-softmax)
+            cz_lz = self.c_z * torch.mean(torch.logsumexp(router_logits, dim=-1).pow(2))
+        else:
+            cz_lz = torch.zeros((), dtype=x.dtype, device=x.device)
+
+        # convert back to original batch/object shape, with the MoE output in the last dimension
+        final_output = final_output.view(original_shape[0], original_shape[1], self.embed_dim)
+
+        return final_output, l_aux, cz_lz
+
+
 class TransformerBlockModule(nn.Module):
     def __init__(self, projection_dim, num_heads, dropout, talking_head, layer_scale, layer_scale_init,
-                 drop_probability):
+                 drop_probability, use_moe: bool, moe_base_num_experts: int, moe_base_select_top_k: int,
+                 moe_num_shared_experts: int, moe_expert_segmentation_factor: int,
+                 moe_scale_expert_dim: bool, moe_alpha: float, moe_cz: float,
+                 moe_use_router_noise: bool):
         super().__init__()
         self.projection_dim = projection_dim
         self.num_heads = num_heads
@@ -18,6 +193,7 @@ class TransformerBlockModule(nn.Module):
         self.talking_head = talking_head
         self.layer_scale_flag = layer_scale
         self.drop_probability = drop_probability
+        self.use_moe = use_moe
 
         self.norm1 = nn.LayerNorm(projection_dim)
         self.norm2 = nn.LayerNorm(projection_dim)
@@ -27,13 +203,30 @@ class TransformerBlockModule(nn.Module):
         else:
             self.attn = nn.MultiheadAttention(projection_dim, num_heads, dropout, batch_first=True)
 
-        self.mlp = nn.Sequential(
-            nn.Linear(projection_dim, 2 * projection_dim),
-            nn.GELU(approximate='none'),
-            nn.Dropout(dropout),
-            nn.Linear(2 * projection_dim, projection_dim),
-        )
+        if not self.use_moe:
+            self.mlp = nn.Sequential(
+                nn.Linear(projection_dim, 2 * projection_dim),
+                nn.GELU(approximate="none"),
+                nn.Dropout(dropout),
+                nn.Linear(2 * projection_dim, projection_dim),
+            )
+        else:
+            self.mlp = MoE(
+                embed_dim=projection_dim,
+                feedforward_dim=2 * projection_dim,
+                base_num_experts=moe_base_num_experts,
+                base_select_top_k=moe_base_select_top_k,
+                num_shared_experts=moe_num_shared_experts,
+                expert_segmentation_factor=moe_expert_segmentation_factor,
+                scale_expert_dim=moe_scale_expert_dim,
+                alpha=moe_alpha,
+                c_z=moe_cz,
+                use_router_noise=moe_use_router_noise,
+                dropout=dropout,
+            )
 
+        self.moe_l_aux = torch.tensor(0.0)
+        self.moe_cz_lz = torch.tensor(0.0)
         self.drop_path = StochasticDepth(drop_probability)
 
         if layer_scale:
@@ -42,6 +235,9 @@ class TransformerBlockModule(nn.Module):
 
     def forward(self, x, mask, attn_mask=None):
         # TransformerBlock input shapes: x: torch.Size([B, P, 128]), mask: torch.Size([B, P, 1])
+        self.moe_l_aux = x.new_zeros(())
+        self.moe_cz_lz = x.new_zeros(())
+
         padding_mask = ~(mask.squeeze(2).bool()) if mask is not None else None  # [batch_size, num_objects]
         if self.talking_head:
 
@@ -70,11 +266,19 @@ class TransformerBlockModule(nn.Module):
             # Input updates: torch.Size([B, P, 128]), mask: torch.Size([B, P])
             x2 = x + self.drop_path(self.layer_scale1(updates, mask))
             x3 = self.norm2(x2)
-            x = x2 + self.drop_path(self.layer_scale2(self.mlp(x3), mask))
+            if self.use_moe:
+                x4, self.moe_l_aux, self.moe_cz_lz = self.mlp(x3)
+            else:
+                x4 = self.mlp(x3)
+            x = x2 + self.drop_path(self.layer_scale2(x4, mask))
         else:
             x2 = x + self.drop_path(updates)
             x3 = self.norm2(x2)
-            x = x2 + self.drop_path(self.mlp(x3))
+            if self.use_moe:
+                x4, self.moe_l_aux, self.moe_cz_lz = self.mlp(x3)
+            else:
+                x4 = self.mlp(x3)
+            x = x2 + self.drop_path(x4)
 
         if mask is not None:
             x = x * mask
@@ -395,4 +599,3 @@ class SegmentationTransformerBlockModule(nn.Module):
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
         return tgt
-
