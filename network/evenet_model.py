@@ -87,9 +87,6 @@ class EveNetModel(nn.Module):
         self.global_input_dim: int = global_normalizer_info["norm_mask"].size()[-1]
         self.sequential_input_dim: int = input_normalizers_setting["SEQUENTIAL"]["norm_mask"].size()[-1]
         self.local_feature_indices = self.network_cfg.Body.PET.local_point_index
-        self.invisible_input_dim: int = len(normalization_dict["invisible_mean"]["Source"])
-        self.invisible_padding: int = self.sequential_input_dim - self.invisible_input_dim
-        assert self.invisible_padding >= 0, f"Invisible Padding size {self.invisible_padding} is negative. "
 
         self.sequential_normalizer = Normalizer(
             norm_mask=input_normalizers_setting["SEQUENTIAL"]["norm_mask"].to(self.device),
@@ -111,7 +108,12 @@ class EveNetModel(nn.Module):
                 norm_mask=torch.tensor([1], device=self.device, dtype=torch.bool)
             )
 
+        self.invisible_padding: int = 0
         if self.include_neutrino_generation:
+            self.invisible_input_dim: int = len(normalization_dict["invisible_mean"]["Source"])
+            self.invisible_padding = self.sequential_input_dim - self.invisible_input_dim
+            assert self.invisible_padding >= 0, f"Invisible Padding size {self.invisible_padding} is negative. "
+
             self.invisible_normalizer = Normalizer(
                 mean=normalization_dict["invisible_mean"]["Source"].to(self.device),
                 std=normalization_dict["invisible_std"]["Source"].to(self.device),
@@ -153,15 +155,6 @@ class EveNetModel(nn.Module):
             layer_scale_init=pet_config.layer_scale_init,
             dropout=pet_config.dropout,
             mode=pet_config.mode,
-            use_moe=pet_config.use_moe,
-            moe_base_num_experts=pet_config.moe_base_num_experts,
-            moe_base_select_top_k=pet_config.moe_base_select_top_k,
-            moe_num_shared_experts=pet_config.moe_num_shared_experts,
-            moe_expert_segmentation_factor=pet_config.moe_expert_segmentation_factor,
-            moe_scale_expert_dim=pet_config.moe_scale_expert_dim,
-            moe_alpha=pet_config.moe_alpha,
-            moe_cz=pet_config.moe_cz,
-            moe_use_router_noise=pet_config.moe_use_router_noise,
         )
 
         # [2] Classification + Regression + Assignment Body
@@ -383,7 +376,7 @@ class EveNetModel(nn.Module):
             num_point_cloud = x['num_sequential_vectors'].unsqueeze(-1)  # (batch_size, 1)
 
         B, _, num_features = input_point_cloud.shape
-        if 'x_invisible' in x:
+        if 'x_invisible' in x and self.include_neutrino_generation:
             invisible_point_cloud = x['x_invisible']
             pad_size = self.invisible_padding
 
@@ -468,8 +461,6 @@ class EveNetModel(nn.Module):
 
         full_input_point_cloud = None
         full_global_conditions = None
-        moe_l_aux_total = torch.zeros((), device=input_point_cloud.device, dtype=input_point_cloud.dtype)
-        moe_cz_lz_total = torch.zeros((), device=input_point_cloud.device, dtype=input_point_cloud.dtype)
 
         for schedule_name, flag  in schedules:
             if not flag:
@@ -546,8 +537,6 @@ class EveNetModel(nn.Module):
                 time=full_time,
                 time_masking=time_masking
             )
-            moe_l_aux_total += self.PET.moe_l_aux
-            moe_cz_lz_total += self.PET.moe_cz_lz
 
             if schedule_name == "deterministic" or schedule_name == "generation":
                 ######################################
@@ -666,9 +655,7 @@ class EveNetModel(nn.Module):
             # "full_global_conditions": full_global_conditions,
             "alpha": alpha,
             "segmentation-mask": outputs.get("deterministic", {}).get("segmentation-out", {}).get("pred_masks", None),
-            "segmentation-aux": outputs.get("deterministic", {}).get("segmentation-out", {}).get("aux_outputs", None),
-            "L_aux": moe_l_aux_total,
-            "cz_Lz": moe_cz_lz_total,
+            "segmentation-aux": outputs.get("deterministic", {}).get("segmentation-out", {}).get("aux_outputs", None)
         }
 
     def predict_diffusion_vector(

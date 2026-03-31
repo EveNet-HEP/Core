@@ -8,7 +8,7 @@ from evenet.network.layers.linear_block import create_linear_block
 from evenet.network.layers.transformer import TransformerBlockModule
 from evenet.network.layers.utils import RandomDrop
 import torch
-
+from evenet.network.body.adapter import Adapter
 
 class EmbeddingStack(nn.Module):
     def __init__(self, linear_block_type: str,
@@ -263,11 +263,7 @@ class PETBody(nn.Module):
     def __init__(
             self, num_feat, num_keep, feature_drop, projection_dim, local, K, num_local,
             num_layers, num_heads, drop_probability, talking_head, layer_scale,
-            layer_scale_init, dropout, mode, use_moe: bool,
-            moe_base_num_experts: int, moe_base_select_top_k: int,
-            moe_num_shared_experts: int, moe_expert_segmentation_factor: int,
-            moe_scale_expert_dim: bool, moe_alpha: float, moe_cz: float,
-            moe_use_router_noise: bool
+            layer_scale_init, dropout, mode, use_adapter: bool = False
     ):
         super().__init__()
         self.num_keep = num_keep
@@ -299,15 +295,18 @@ class PETBody(nn.Module):
         self.transformer_blocks = nn.ModuleList([
             TransformerBlockModule(
                 projection_dim, num_heads, dropout, talking_head, layer_scale, layer_scale_init,
-                drop_probability, use_moe=use_moe, moe_base_num_experts=moe_base_num_experts,
-                moe_base_select_top_k=moe_base_select_top_k, moe_num_shared_experts=moe_num_shared_experts,
-                moe_expert_segmentation_factor=moe_expert_segmentation_factor,
-                moe_scale_expert_dim=moe_scale_expert_dim,
-                moe_alpha=moe_alpha, moe_cz=moe_cz,
-                moe_use_router_noise=moe_use_router_noise
+                drop_probability
             )
             for _ in range(num_layers)
         ])
+
+        self.use_adapter = use_adapter
+        if self.use_adapter:
+            self.adapters = nn.ModuleList([
+                Adapter(projection_dim, bottleneck=16, dropout=dropout)
+                for _ in range(num_layers)
+            ])
+
 
     def forward(self,
                 input_features: Tensor,
@@ -351,18 +350,16 @@ class PETBody(nn.Module):
             encoded = local_features + encoded  # Combine with original features
 
         skip_connection = encoded
-        moe_l_aux = encoded.new_zeros(())
-        moe_cz_lz = encoded.new_zeros(())
-        for transformer_block in self.transformer_blocks:
+        for itransformer, transformer_block in enumerate(self.transformer_blocks):
             encoded = transformer_block(
                 x=encoded,
                 mask=mask,
                 attn_mask=attn_mask
             )
-            moe_l_aux += transformer_block.moe_l_aux.to(encoded.device)
-            moe_cz_lz += transformer_block.moe_cz_lz.to(encoded.device)
-        self.moe_l_aux = moe_l_aux
-        self.moe_cz_lz = moe_cz_lz
+            if self.use_adapter:
+                encoded = self.adapters[itransformer](encoded)
+                encoded = encoded * mask.float()
+
 
         return torch.add(encoded, skip_connection)
 
@@ -443,3 +440,4 @@ class PointCloudPositionalEmbedding(nn.Module):
         x = (x + position_token) * x_mask.float()
 
         return x  # (B, N, D)
+
