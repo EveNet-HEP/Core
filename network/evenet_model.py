@@ -108,9 +108,10 @@ class EveNetModel(nn.Module):
                 norm_mask=torch.tensor([1], device=self.device, dtype=torch.bool)
             )
 
+        self.invisible_padding: int = 0
         if self.include_neutrino_generation:
             self.invisible_input_dim: int = len(normalization_dict["invisible_mean"]["Source"])
-            self.invisible_padding: int = self.sequential_input_dim - self.invisible_input_dim
+            self.invisible_padding = self.sequential_input_dim - self.invisible_input_dim
             assert self.invisible_padding >= 0, f"Invisible Padding size {self.invisible_padding} is negative. "
 
             self.invisible_normalizer = Normalizer(
