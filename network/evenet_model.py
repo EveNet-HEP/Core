@@ -21,6 +21,7 @@ from evenet.utilities.tool import gather_index
 from torch import Tensor, nn
 from typing import Dict, Optional, Any, Union
 import re
+import logging
 
 
 class EveNetModel(nn.Module):
@@ -325,6 +326,41 @@ class EveNetModel(nn.Module):
             ("neutrino_generation", self.include_neutrino_generation),
             ("deterministic", self.include_classification or self.include_assignment or self.include_regression or self.include_segmentation),
         ]
+
+        self._log_backbone_setup()
+
+    def _log_backbone_setup(self) -> None:
+        logger = logging.getLogger(__name__)
+        pet_cfg = self.network_cfg.Body.PET
+
+        pretrain_path = getattr(getattr(self.options, "Training", None), "pretrain_model_load_path", None)
+        if pretrain_path:
+            logger.info(f"[Backbone] Pretrain path       : {pretrain_path}")
+        else:
+            logger.warning("[Backbone] No pretrain_model_load_path set — training from scratch.")
+
+        logger.info(
+            f"[Backbone] PET config          : "
+            f"layers={pet_cfg.num_layers}, "
+            f"heads={pet_cfg.num_heads}, "
+            f"dim={pet_cfg.hidden_dim}, "
+            f"mode={pet_cfg.mode}"
+        )
+        logger.info(
+            f"[Backbone] MoE enabled         : {pet_cfg.use_moe}"
+        )
+        if pet_cfg.use_moe:
+            logger.info(
+                f"[Backbone] MoE config          : "
+                f"num_experts={pet_cfg.moe_base_num_experts}, "
+                f"top_k={pet_cfg.moe_base_select_top_k}, "
+                f"shared_experts={pet_cfg.moe_num_shared_experts}, "
+                f"seg_factor={pet_cfg.moe_expert_segmentation_factor}, "
+                f"scale_dim={pet_cfg.moe_scale_expert_dim}, "
+                f"alpha={pet_cfg.moe_alpha}, "
+                f"cz={pet_cfg.moe_cz}, "
+                f"router_noise={pet_cfg.moe_use_router_noise}"
+            )
 
     def forward(
             self, x: Dict[str, Tensor], time: Tensor,

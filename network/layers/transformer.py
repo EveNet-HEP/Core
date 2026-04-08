@@ -1,3 +1,5 @@
+import logging
+
 import torch.nn as nn
 from torch import Tensor
 import torch
@@ -8,6 +10,8 @@ from evenet.network.layers.linear_block import GRUGate, GRUBlock
 from evenet.network.layers.activation import create_residual_connection
 
 from typing import Optional
+
+_moe_logger = logging.getLogger(__name__)
 
 
 class Gate(nn.Module):
@@ -99,6 +103,7 @@ class MoE(nn.Module):
                 Expert(embed_dim, self.expert_hidden_dim, dropout)
                 for _ in range(self.num_shared_experts)
         ])
+        self._forward_logged = False
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         original_shape = x.shape
@@ -107,6 +112,48 @@ class MoE(nn.Module):
         num_objects = x.shape[0]
 
         router_logits, dense_gate_weights, topk_weights, topk_indices = self.gate(x)
+
+        if not self._forward_logged:
+            expert_w_in  = self.routed_experts[0].ffn[0].weight.shape  # (hidden, embed)
+            expert_w_out = self.routed_experts[0].ffn[3].weight.shape  # (embed, hidden)
+            gate_w       = self.gate.router.weight.shape                # (num_experts, embed)
+
+            shape_ok = (
+                x.shape[-1]             == self.embed_dim
+                and router_logits.shape == (num_objects, self.num_experts)
+                and topk_indices.shape  == (num_objects, self.select_top_k)
+                and expert_w_in[0]      == self.expert_hidden_dim
+                and expert_w_in[1]      == self.embed_dim
+                and gate_w[0]           == self.num_experts
+            )
+            level = _moe_logger.info if shape_ok else _moe_logger.error
+
+            level(
+                f"[MoE] First forward — input: {tuple(original_shape)}  "
+                f"(flattened tokens: {num_objects})"
+            )
+            level(
+                f"[MoE]   gate    weight : {tuple(gate_w)}  "
+                f"→ router_logits: {tuple(router_logits.shape)}  "
+                f"topk_indices: {tuple(topk_indices.shape)}"
+            )
+            level(
+                f"[MoE]   expert  ffn[0] : {tuple(expert_w_in)}  "
+                f"ffn[3]: {tuple(expert_w_out)}  "
+                f"(expected hidden={self.expert_hidden_dim}, embed={self.embed_dim})"
+            )
+            if self.num_shared_experts > 0:
+                sh_w_in  = self.shared_experts[0].ffn[0].weight.shape
+                sh_w_out = self.shared_experts[0].ffn[3].weight.shape
+                level(
+                    f"[MoE]   shared  ffn[0] : {tuple(sh_w_in)}  "
+                    f"ffn[3]: {tuple(sh_w_out)}"
+                )
+            if not shape_ok:
+                _moe_logger.error("[MoE]   ❌ Shape mismatch detected — check config vs checkpoint.")
+            else:
+                _moe_logger.info("[MoE]   ✅ All shapes consistent.")
+            self._forward_logged = True
 
         routed_output = torch.zeros((num_objects, self.embed_dim), dtype=x.dtype, device=x.device)
         objects_per_expert = torch.zeros(self.num_experts, dtype=torch.long, device=x.device)
