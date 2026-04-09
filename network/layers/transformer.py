@@ -104,6 +104,11 @@ class MoE(nn.Module):
                 for _ in range(self.num_shared_experts)
         ])
         self._forward_logged = False
+        self.register_buffer('expert_dispatch_counts', torch.zeros(self.num_experts, dtype=torch.long))
+
+    def reset_expert_dispatch_counts(self) -> None:
+        """Reset the accumulated eval-time dispatch counts to zero."""
+        self.expert_dispatch_counts.zero_()
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         original_shape = x.shape
@@ -174,6 +179,9 @@ class MoE(nn.Module):
             expert_weights = expert_weights[order]
             # count how many objects are assigned to each expert to know how to split the input tensor for each expert's forward pass
             objects_per_expert = torch.bincount(expert_indices, minlength=self.num_experts)
+
+            if not self.training:
+                self.expert_dispatch_counts.add_(objects_per_expert.to(self.expert_dispatch_counts.device))
 
             cursor = 0
             # iterate through each expert's assigned objects in order of expert index
@@ -646,4 +654,60 @@ class SegmentationTransformerBlockModule(nn.Module):
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
         return tgt
+
+
+def log_moe_expert_distribution(
+    model: nn.Module,
+    reset: bool = True,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Log the expert dispatch distribution for every MoE layer in *model*.
+
+    Call this after running eval batches to see how evenly inputs were routed.
+    Counts are accumulated across all eval forward passes since the last reset.
+
+    Args:
+        model:  Any nn.Module that may contain MoE sub-modules.
+        reset:  If True (default), zero the counts after logging so the next
+                eval epoch starts fresh.
+        logger: Logger to write to.  Defaults to this module's logger.
+
+    Example usage in an eval loop::
+
+        model.eval()
+        for batch in eval_loader:
+            with torch.no_grad():
+                model(batch)
+        log_moe_expert_distribution(model)   # prints distribution, resets counts
+    """
+    log = (logger or _moe_logger).info
+
+    moe_layers = [(name, m) for name, m in model.named_modules() if isinstance(m, MoE)]
+    if not moe_layers:
+        _moe_logger.warning("log_moe_expert_distribution: no MoE layers found in model.")
+        return
+
+    for name, moe in moe_layers:
+        counts = moe.expert_dispatch_counts.cpu()
+        total = counts.sum().item()
+
+        if total == 0:
+            log(f"[MoE dist] {name}: no eval data recorded (counts are all zero).")
+            if reset:
+                moe.reset_expert_dispatch_counts()
+            continue
+
+        uniform = total / moe.num_experts
+        lines = [
+            f"[MoE dist] {name}  "
+            f"(total dispatches={total:,}, ideal per expert={uniform:,.1f})"
+        ]
+        for i, c in enumerate(counts.tolist()):
+            pct = 100.0 * c / total
+            bar = "█" * int(pct / 2)  # each block ≈ 2 %
+            lines.append(f"  expert {i:3d}: {c:9,d}  ({pct:5.1f}%)  {bar}")
+        log("\n".join(lines))
+
+        if reset:
+            moe.reset_expert_dispatch_counts()
 
