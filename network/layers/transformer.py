@@ -131,18 +131,16 @@ class MoE(nn.Module):
                 and expert_w_in[1]      == self.embed_dim
                 and gate_w[0]           == self.num_experts
             )
-            level = _moe_logger.info if shape_ok else _moe_logger.error
-
-            level(
+            print(
                 f"[MoE] First forward — input: {tuple(original_shape)}  "
                 f"(flattened tokens: {num_objects})"
             )
-            level(
+            print(
                 f"[MoE]   gate    weight : {tuple(gate_w)}  "
                 f"→ router_logits: {tuple(router_logits.shape)}  "
                 f"topk_indices: {tuple(topk_indices.shape)}"
             )
-            level(
+            print(
                 f"[MoE]   expert  ffn[0] : {tuple(expert_w_in)}  "
                 f"ffn[3]: {tuple(expert_w_out)}  "
                 f"(expected hidden={self.expert_hidden_dim}, embed={self.embed_dim})"
@@ -150,14 +148,14 @@ class MoE(nn.Module):
             if self.num_shared_experts > 0:
                 sh_w_in  = self.shared_experts[0].ffn[0].weight.shape
                 sh_w_out = self.shared_experts[0].ffn[3].weight.shape
-                level(
+                print(
                     f"[MoE]   shared  ffn[0] : {tuple(sh_w_in)}  "
                     f"ffn[3]: {tuple(sh_w_out)}"
                 )
             if not shape_ok:
-                _moe_logger.error("[MoE]   ❌ Shape mismatch detected — check config vs checkpoint.")
+                print("[MoE]   ❌ Shape mismatch detected — check config vs checkpoint.")
             else:
-                _moe_logger.info("[MoE]   ✅ All shapes consistent.")
+                print("[MoE]   ✅ All shapes consistent.")
             self._forward_logged = True
 
         routed_output = torch.zeros((num_objects, self.embed_dim), dtype=x.dtype, device=x.device)
@@ -680,11 +678,12 @@ def log_moe_expert_distribution(
                 model(batch)
         log_moe_expert_distribution(model)   # prints distribution, resets counts
     """
-    log = (logger or _moe_logger).info
+    _log = (logger.info if logger is not None else print)
+    _warn = (logger.warning if logger is not None else print)
 
     moe_layers = [(name, m) for name, m in model.named_modules() if isinstance(m, MoE)]
     if not moe_layers:
-        _moe_logger.warning("log_moe_expert_distribution: no MoE layers found in model.")
+        _warn("log_moe_expert_distribution: no MoE layers found in model.")
         return
 
     for name, moe in moe_layers:
@@ -692,7 +691,7 @@ def log_moe_expert_distribution(
         total = counts.sum().item()
 
         if total == 0:
-            log(f"[MoE dist] {name}: no eval data recorded (counts are all zero).")
+            _log(f"[MoE dist] {name}: no eval data recorded (counts are all zero).")
             if reset:
                 moe.reset_expert_dispatch_counts()
             continue
@@ -706,7 +705,7 @@ def log_moe_expert_distribution(
             pct = 100.0 * c / total
             bar = "█" * int(pct / 2)  # each block ≈ 2 %
             lines.append(f"  expert {i:3d}: {c:9,d}  ({pct:5.1f}%)  {bar}")
-        log("\n".join(lines))
+        _log("\n".join(lines))
 
         if reset:
             moe.reset_expert_dispatch_counts()
