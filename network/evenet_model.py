@@ -21,6 +21,7 @@ from evenet.utilities.tool import gather_index
 from torch import Tensor, nn
 from typing import Dict, Optional, Any, Union
 import re
+import logging
 
 
 class EveNetModel(nn.Module):
@@ -155,6 +156,15 @@ class EveNetModel(nn.Module):
             layer_scale_init=pet_config.layer_scale_init,
             dropout=pet_config.dropout,
             mode=pet_config.mode,
+            use_moe=pet_config.use_moe,
+            moe_base_num_experts=pet_config.moe_base_num_experts,
+            moe_base_select_top_k=pet_config.moe_base_select_top_k,
+            moe_num_shared_experts=pet_config.moe_num_shared_experts,
+            moe_expert_segmentation_factor=pet_config.moe_expert_segmentation_factor,
+            moe_scale_expert_dim=pet_config.moe_scale_expert_dim,
+            moe_alpha=pet_config.moe_alpha,
+            moe_cz=pet_config.moe_cz,
+            moe_use_router_noise=pet_config.moe_use_router_noise,
         )
 
         # [2] Classification + Regression + Assignment Body
@@ -317,6 +327,41 @@ class EveNetModel(nn.Module):
             ("deterministic", self.include_classification or self.include_assignment or self.include_regression or self.include_segmentation),
         ]
 
+        self._log_backbone_setup()
+
+    def _log_backbone_setup(self) -> None:
+        logger = logging.getLogger(__name__)
+        pet_cfg = self.network_cfg.Body.PET
+
+        pretrain_path = getattr(getattr(self.options, "Training", None), "pretrain_model_load_path", None)
+        if pretrain_path:
+            logger.info(f"[Backbone] Pretrain path       : {pretrain_path}")
+        else:
+            logger.warning("[Backbone] No pretrain_model_load_path set — training from scratch.")
+
+        logger.info(
+            f"[Backbone] PET config          : "
+            f"layers={pet_cfg.num_layers}, "
+            f"heads={pet_cfg.num_heads}, "
+            f"dim={pet_cfg.hidden_dim}, "
+            f"mode={pet_cfg.mode}"
+        )
+        logger.info(
+            f"[Backbone] MoE enabled         : {pet_cfg.use_moe}"
+        )
+        if pet_cfg.use_moe:
+            logger.info(
+                f"[Backbone] MoE config          : "
+                f"num_experts={pet_cfg.moe_base_num_experts}, "
+                f"top_k={pet_cfg.moe_base_select_top_k}, "
+                f"shared_experts={pet_cfg.moe_num_shared_experts}, "
+                f"seg_factor={pet_cfg.moe_expert_segmentation_factor}, "
+                f"scale_dim={pet_cfg.moe_scale_expert_dim}, "
+                f"alpha={pet_cfg.moe_alpha}, "
+                f"cz={pet_cfg.moe_cz}, "
+                f"router_noise={pet_cfg.moe_use_router_noise}"
+            )
+
     def forward(
             self, x: Dict[str, Tensor], time: Tensor,
             progressive_params: dict = None,
@@ -461,6 +506,8 @@ class EveNetModel(nn.Module):
 
         full_input_point_cloud = None
         full_global_conditions = None
+        moe_l_aux_total = torch.zeros((), device=input_point_cloud.device, dtype=input_point_cloud.dtype)
+        moe_cz_lz_total = torch.zeros((), device=input_point_cloud.device, dtype=input_point_cloud.dtype)
 
         for schedule_name, flag  in schedules:
             if not flag:
@@ -537,6 +584,8 @@ class EveNetModel(nn.Module):
                 time=full_time,
                 time_masking=time_masking
             )
+            moe_l_aux_total += self.PET.moe_l_aux
+            moe_cz_lz_total += self.PET.moe_cz_lz
 
             if schedule_name == "deterministic" or schedule_name == "generation":
                 ######################################
@@ -655,7 +704,9 @@ class EveNetModel(nn.Module):
             # "full_global_conditions": full_global_conditions,
             "alpha": alpha,
             "segmentation-mask": outputs.get("deterministic", {}).get("segmentation-out", {}).get("pred_masks", None),
-            "segmentation-aux": outputs.get("deterministic", {}).get("segmentation-out", {}).get("aux_outputs", None)
+            "segmentation-aux": outputs.get("deterministic", {}).get("segmentation-out", {}).get("aux_outputs", None),
+            "L_aux": moe_l_aux_total,
+            "cz_Lz": moe_cz_lz_total,
         }
 
     def predict_diffusion_vector(

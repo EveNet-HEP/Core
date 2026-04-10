@@ -123,6 +123,6 @@ def setup_logging(log_level=logging.INFO, rank: int = 0, log_dir="logs"):
         format=f"%(asctime)s | %(name)s | %(levelname)s | %(message)s",
         handlers=[
             logging.FileHandler(log_file, mode="a"),
-            # logging.StreamHandler() if rank == 0 else logging.NullHandler(),  # Only rank 0 logs to stdout
+            logging.StreamHandler() if rank == 0 else logging.NullHandler(),
         ]
     )

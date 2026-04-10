@@ -263,7 +263,11 @@ class PETBody(nn.Module):
     def __init__(
             self, num_feat, num_keep, feature_drop, projection_dim, local, K, num_local,
             num_layers, num_heads, drop_probability, talking_head, layer_scale,
-            layer_scale_init, dropout, mode, use_adapter: bool = False
+            layer_scale_init, dropout, mode, use_adapter: bool = False,
+            use_moe: bool = False, moe_base_num_experts: int = 4,
+            moe_base_select_top_k: int = 2, moe_num_shared_experts: int = 0,
+            moe_expert_segmentation_factor: int = 1, moe_scale_expert_dim: bool = False,
+            moe_alpha: float = 0.01, moe_cz: float = 0.0, moe_use_router_noise: bool = False
     ):
         super().__init__()
         self.num_keep = num_keep
@@ -295,7 +299,12 @@ class PETBody(nn.Module):
         self.transformer_blocks = nn.ModuleList([
             TransformerBlockModule(
                 projection_dim, num_heads, dropout, talking_head, layer_scale, layer_scale_init,
-                drop_probability
+                drop_probability, use_moe=use_moe, moe_base_num_experts=moe_base_num_experts,
+                moe_base_select_top_k=moe_base_select_top_k, moe_num_shared_experts=moe_num_shared_experts,
+                moe_expert_segmentation_factor=moe_expert_segmentation_factor,
+                moe_scale_expert_dim=moe_scale_expert_dim,
+                moe_alpha=moe_alpha, moe_cz=moe_cz,
+                moe_use_router_noise=moe_use_router_noise
             )
             for _ in range(num_layers)
         ])
@@ -350,16 +359,21 @@ class PETBody(nn.Module):
             encoded = local_features + encoded  # Combine with original features
 
         skip_connection = encoded
+        moe_l_aux = encoded.new_zeros(())
+        moe_cz_lz = encoded.new_zeros(())
         for itransformer, transformer_block in enumerate(self.transformer_blocks):
             encoded = transformer_block(
                 x=encoded,
                 mask=mask,
                 attn_mask=attn_mask
             )
+            moe_l_aux += transformer_block.moe_l_aux.to(encoded.device)
+            moe_cz_lz += transformer_block.moe_cz_lz.to(encoded.device)
             if self.use_adapter:
                 encoded = self.adapters[itransformer](encoded)
                 encoded = encoded * mask.float()
-
+        self.moe_l_aux = moe_l_aux
+        self.moe_cz_lz = moe_cz_lz
 
         return torch.add(encoded, skip_connection)
 
