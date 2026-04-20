@@ -3,6 +3,7 @@ import pickle
 from evenet.control.global_config import DotDict
 
 from evenet.network.layers.utils import RandomDrop
+from evenet.network.layers.invisible_input_projector import InvisibleInputProjector
 
 from evenet.network.body.normalizer import Normalizer
 from evenet.network.body.embedding import GlobalVectorEmbedding, PETBody
@@ -111,15 +112,16 @@ class EveNetModel(nn.Module):
         self.invisible_padding: int = 0
         if self.include_neutrino_generation:
             self.invisible_input_dim: int = len(normalization_dict["invisible_mean"]["Source"])
-            self.invisible_padding = self.sequential_input_dim - self.invisible_input_dim
-            assert self.invisible_padding >= 0, f"Invisible Padding size {self.invisible_padding} is negative. "
 
             self.invisible_normalizer = Normalizer(
                 mean=normalization_dict["invisible_mean"]["Source"].to(self.device),
                 std=normalization_dict["invisible_std"]["Source"].to(self.device),
                 norm_mask=torch.tensor([1], device=self.device, dtype=torch.bool),
                 inv_cdf_index=self.event_info.invisible_inv_cdf_index,
-                padding_size=self.invisible_padding,
+            )
+            self.InvisibleInputProjector = InvisibleInputProjector(
+                input_dim=self.invisible_input_dim,
+                output_dim=self.sequential_input_dim,
             )
 
         # [1] Body
@@ -282,7 +284,7 @@ class EveNetModel(nn.Module):
                 projection_dim=self.network_cfg.TruthGeneration.hidden_dim,
                 num_global_cond=global_embedding_cfg.hidden_dim,
                 num_classes=self.event_info.num_classes_total,
-                output_dim=self.invisible_input_dim + self.invisible_padding,
+                output_dim=self.invisible_input_dim,
                 num_layers=self.network_cfg.TruthGeneration.num_layers,
                 num_heads=self.network_cfg.TruthGeneration.num_heads,
                 dropout=self.network_cfg.TruthGeneration.dropout,
@@ -316,6 +318,11 @@ class EveNetModel(nn.Module):
             ("neutrino_generation", self.include_neutrino_generation),
             ("deterministic", self.include_classification or self.include_assignment or self.include_regression or self.include_segmentation),
         ]
+
+    def project_invisible_inputs(self, x: Tensor, mask: Tensor) -> Tensor:
+        if not self.include_neutrino_generation:
+            return x
+        return self.InvisibleInputProjector(x=x, mask=mask)
 
     def forward(
             self, x: Dict[str, Tensor], time: Tensor,
@@ -378,12 +385,8 @@ class EveNetModel(nn.Module):
         B, _, num_features = input_point_cloud.shape
         if 'x_invisible' in x and self.include_neutrino_generation:
             invisible_point_cloud = x['x_invisible']
-            pad_size = self.invisible_padding
-
-            # Pad invisible features to match input
-            invisible_point_cloud = F.pad(invisible_point_cloud, (0, pad_size), value=0.0)
         else:
-            invisible_point_cloud = torch.zeros(B, 1, num_features, device=input_point_cloud.device)
+            invisible_point_cloud = torch.zeros(B, 1, self.invisible_input_dim, device=input_point_cloud.device)
 
         invisible_point_cloud_mask = x['x_invisible_mask'].unsqueeze(
             -1) if 'x_invisible_mask' in x else torch.zeros_like(input_point_cloud_mask[:, [0], :]).bool()
@@ -510,7 +513,11 @@ class EveNetModel(nn.Module):
                 invisible_point_cloud_noised, truth_invisible_point_cloud_vector = add_noise(
                     invisible_point_cloud, time
                 )
-                full_input_point_cloud = torch.cat([input_point_cloud, invisible_point_cloud_noised], dim=1)
+                invisible_point_cloud_projected = self.project_invisible_inputs(
+                    x=invisible_point_cloud_noised,
+                    mask=invisible_point_cloud_mask,
+                )
+                full_input_point_cloud = torch.cat([input_point_cloud, invisible_point_cloud_projected], dim=1)
                 full_input_point_cloud_mask = torch.cat([input_point_cloud_mask, invisible_point_cloud_mask], dim=1)
                 full_attn_mask = invisible_attn_mask
                 full_time = time
@@ -759,12 +766,10 @@ class EveNetModel(nn.Module):
 
             invisible_point_cloud_noised = noise_x
             invisible_point_cloud_mask = noise_mask
-
-            # padding invisible features to match input
-            if self.invisible_padding > 0:
-                invisible_point_cloud_noised = F.pad(
-                    invisible_point_cloud_noised, (0, self.invisible_padding), value=0.0
-                )
+            invisible_point_cloud_projected = self.project_invisible_inputs(
+                x=invisible_point_cloud_noised,
+                mask=invisible_point_cloud_mask,
+            )
 
             # Create attention mask
             n_vis = input_point_cloud_mask.shape[1]
@@ -776,7 +781,7 @@ class EveNetModel(nn.Module):
             # Rule: visible query (False) cannot attend to invisible key (True)
             invisible_attn_mask = (~is_invisible_query[:, None]) & is_invisible_query[None, :]  # (L, L) , Q->K
 
-            full_input_point_cloud = torch.cat([input_point_cloud, invisible_point_cloud_noised], dim=1)
+            full_input_point_cloud = torch.cat([input_point_cloud, invisible_point_cloud_projected], dim=1)
             full_input_point_cloud_mask = torch.cat([input_point_cloud_mask, invisible_point_cloud_mask], dim=1)
             full_attn_mask = invisible_attn_mask
             full_time = time
@@ -810,10 +815,6 @@ class EveNetModel(nn.Module):
                 time_masking=time_masking,
                 position_encode=self.neutrino_position_encode
             )
-
-            # remove the padding
-            if self.invisible_padding > 0:
-                pred_point_cloud_vector = pred_point_cloud_vector[..., :-self.invisible_padding]
 
             return pred_point_cloud_vector[:, is_invisible_query, :]
         return None
