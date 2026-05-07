@@ -195,7 +195,8 @@ class GenerationMetrics:
                 num_steps=num_steps_neutrino,
                 use_tqdm=False,
                 process_name=f"Neutrino",
-                remove_padding=(getattr(model, "invisible_padding", 0) > 0),
+                # remove_padding=(getattr(model, "invisible_padding", 0) > 0),
+                remove_padding=False,
             )
 
             for i in range(data_shape[-1]):
