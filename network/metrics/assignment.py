@@ -159,6 +159,8 @@ def predict(assignments: List[Tensor],
             softmax = torch.nn.Softmax(dim=-1)
 
             detection_prob = softmax(detection_result)
+            # survival[:, r - 1] = P(N >= r)
+            survival = detection_prob[:, 1:].flip(-1).cumsum(-1).flip(-1)
 
             assignment_tmp = torch.stack([assignments_indices[element] for element in symmetry_element])
             assignment_probability_tmp = torch.stack(
@@ -170,13 +172,10 @@ def predict(assignments: List[Tensor],
             assignment_sorted = torch.gather(assignment_tmp, dim=0, index=expanded_sort_index)
             assignment_probability = torch.gather(assignment_probability_tmp, dim=0, index=sort_index)
 
-            init_probabilities = torch.ones_like(assignment_probability[0])
             for iorder in range(len(symmetry_element)):
                 final_assignments_indices.append(assignment_sorted[iorder])
                 final_assignments_probabilities.append(assignment_probability[iorder])
-                detections_probabilities = 1.0 - (detection_prob[:, iorder] / init_probabilities)
-                init_probabilities = detections_probabilities
-                final_detections_probabilities.append(detections_probabilities)
+                final_detections_probabilities.append(survival[:, iorder])
 
     return {
         "best_indices": final_assignments_indices,

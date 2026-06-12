@@ -301,7 +301,7 @@ def loss_single_process(
     for symmetry_group in event_permutations:
         for symmetry_element in symmetry_group:
             symmetry_element = np.array(symmetry_element)
-            detection = detections[symmetry_element[0]]
+            detection = detections[symmetry_element[0]] # All the symmetry group detection/assignment outputs are just duplicated
             detection_target = torch.stack([detections_target[symmetry_index] for symmetry_index in symmetry_element])
             detection_target = detection_target.sum(0).long()
 
