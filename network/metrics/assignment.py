@@ -123,17 +123,45 @@ def predict(assignments: List[Tensor],
             product_symbolic_groups,
             event_permutations):
     device = assignments[0].device
+    scaled_assignments = list(assignments)
+    for symmetry_group in event_permutations:
+        for symmetry_element in symmetry_group:
+            symmetry_element = np.asarray(symmetry_element)
+            detection_prob = torch.softmax(
+                detections[symmetry_element[0]],
+                dim=-1,
+            )
+            survival = detection_prob[:, 1:].flip(-1).cumsum(-1).flip(-1)
+            expected_count = survival[:, :len(symmetry_element)].sum(-1)
+            expected_count = expected_count.clamp_min(1e-6)
+            for index in symmetry_element:
+                assignment = assignments[index]
+                broadcast_shape = (-1,) + (1,) * (assignment.ndim - 1)
+
+                scaled_assignments[index] = (
+                        assignment
+                        + expected_count.log().view(broadcast_shape)
+                )
+
+    selection_assignments = [
+        assignment + np.log(symmetries.order())
+        for assignment, symmetries in zip(
+            scaled_assignments,
+            product_symbolic_groups.values(),
+        )
+    ]
+
     assignments_indices = extract_predictions(
         [
             torch.nan_to_num(assignment, nan=-float('inf'))
-            for assignment in assignments
+            for assignment in selection_assignments
         ]
     )
-
     assignment_probabilities = []
     dummy_index = torch.arange(assignments_indices[0].shape[0])
+
     for assignment_probability, assignment, symmetries in zip(
-            assignments,
+            scaled_assignments,
             assignments_indices,
             product_symbolic_groups.values()
     ):
@@ -157,7 +185,6 @@ def predict(assignments: List[Tensor],
             symmetry_element = np.sort(np.array(symmetry_element))
             detection_result = detections[symmetry_element[0]]
             softmax = torch.nn.Softmax(dim=-1)
-
             detection_prob = softmax(detection_result)
             # survival[:, r - 1] = P(N >= r)
             survival = detection_prob[:, 1:].flip(-1).cumsum(-1).flip(-1)
