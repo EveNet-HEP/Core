@@ -423,11 +423,19 @@ class SingleProcessAssignmentMetrics:
             )
             correct_reco = torch.stack([correct_assigned[iorbit] for iorbit in list(sorted(orbit))], dim=0)
 
-            predict_count_wp = (predict_detection > detection_cut).sum(dim=0).long()
+            count_probabilities = torch.cat(
+                [
+                    1 - predict_detection[0:1],
+                    predict_detection[:-1] - predict_detection[1:],
+                    predict_detection[-1:],
+                ],
+                dim=0,
+            ).clamp_min(0)
+            predict_count = torch.argmax(count_probabilities, dim=0).long()
             count_bins = np.arange(len(names) + 2) - 0.5
             confusion, _, _ = np.histogram2d(
                 truth_count.detach().cpu().numpy(),
-                predict_count_wp.detach().cpu().numpy(),
+                predict_count.detach().cpu().numpy(),
                 bins=[count_bins, count_bins]
             )
             self.detection_count_confusion[cluster_name] += confusion.astype(np.int64, copy=False)
@@ -830,45 +838,71 @@ class SingleProcessAssignmentMetrics:
             )
         return return_plot
 
-    def plot_detection_count_confusion(self):
+    def plot_detection_count_distribution(self):
         return_plot = dict()
         for cluster_name, confusion in self.detection_count_confusion.items():
-            fig, ax = plt.subplots(figsize=(6, 5))
+            max_count = confusion.shape[0] - 1
+            predicted_counts = np.arange(max_count + 1)
             row_sum = confusion.sum(axis=1, keepdims=True)
-            normalized = np.divide(
+            pmf = np.divide(
                 confusion,
                 np.maximum(row_sum, 1),
                 out=np.zeros_like(confusion, dtype=float),
                 where=row_sum > 0,
             )
 
-            im = ax.imshow(normalized, origin="lower", vmin=0, vmax=1, cmap="Blues")
-            fig.colorbar(im, ax=ax, label="Row-normalized density")
+            fig, (ax_matrix, ax_pdf) = plt.subplots(
+                2,
+                1,
+                figsize=(7.5, 8),
+                gridspec_kw={"height_ratios": [1.15, 1]},
+            )
 
-            max_count = confusion.shape[0] - 1
-            ax.set_xticks(np.arange(max_count + 1))
-            ax.set_yticks(np.arange(max_count + 1))
-            ax.set_xlabel(f"Predicted N (WP: {self.detection_cut})")
-            ax.set_ylabel("Truth N")
-            ax.set_title(f"Detection Count Confusion: {cluster_name}")
+            im = ax_matrix.imshow(pmf, origin="lower", vmin=0, vmax=1, cmap="Blues")
+            fig.colorbar(im, ax=ax_matrix, label="P(predicted N | truth N)")
+            ax_matrix.set_xticks(predicted_counts)
+            ax_matrix.set_yticks(predicted_counts)
+            ax_matrix.set_xlabel("Predicted N (argmax)")
+            ax_matrix.set_ylabel("Truth N")
+            ax_matrix.set_title(f"Detection Count Confusion: {cluster_name}")
 
             for truth_count in range(max_count + 1):
                 for predicted_count in range(max_count + 1):
-                    count = int(confusion[truth_count, predicted_count])
-                    if count == 0:
+                    probability = pmf[truth_count, predicted_count]
+                    if probability <= 0:
                         continue
-                    percent = normalized[truth_count, predicted_count]
-                    text_color = "white" if percent > 0.5 else "black"
-                    ax.text(
+                    text_color = "white" if probability > 0.5 else "black"
+                    ax_matrix.text(
                         predicted_count,
                         truth_count,
-                        f"{count}\n{percent:.2f}",
+                        f"{probability:.2f}",
                         ha="center",
                         va="center",
                         fontsize=8,
                         color=text_color,
                     )
 
+            for truth_count in range(max_count + 1):
+                total = row_sum[truth_count, 0]
+                if total <= 0:
+                    continue
+                expected_count = (pmf[truth_count] * predicted_counts).sum()
+                ax_pdf.step(
+                    predicted_counts,
+                    pmf[truth_count],
+                    where="mid",
+                    linewidth=2,
+                    marker="o",
+                    label=f"Truth {truth_count}{cluster_name}: E[N]={expected_count:.2f}",
+                )
+
+            ax_pdf.set_xticks(predicted_counts)
+            ax_pdf.set_ylim(0, 1)
+            ax_pdf.set_xlabel("Predicted N (argmax)")
+            ax_pdf.set_ylabel("P(predicted N | truth N)")
+            ax_pdf.set_title("Count Distribution by Truth")
+            ax_pdf.grid(True, linestyle=":", linewidth=0.5, alpha=0.5)
+            ax_pdf.legend(loc="best", fontsize=8)
             fig.tight_layout()
             return_plot[cluster_name] = fig
         return return_plot
@@ -878,28 +912,16 @@ class SingleProcessAssignmentMetrics:
         for cluster_name, confusion in self.detection_count_confusion.items():
             row_sum = confusion.sum(axis=1)
             max_count = confusion.shape[0] - 1
+            predicted_counts = np.arange(max_count + 1)
             for truth_count in range(max_count + 1):
                 denominator = row_sum[truth_count]
                 if denominator <= 0:
                     continue
 
-                exact_rate = confusion[truth_count, truth_count] / denominator
-                under_rate = confusion[truth_count, :truth_count].sum() / denominator
-                over_rate = confusion[truth_count, truth_count + 1:].sum() / denominator
+                predicted_mean = (confusion[truth_count] * predicted_counts).sum() / denominator
                 return_log[
-                    f"detection/{self.process}/{cluster_name}/truth_{truth_count}/exact_wp"
-                ] = exact_rate
-                return_log[
-                    f"detection/{self.process}/{cluster_name}/truth_{truth_count}/under_wp"
-                ] = under_rate
-                return_log[
-                    f"detection/{self.process}/{cluster_name}/truth_{truth_count}/over_wp"
-                ] = over_rate
-
-                for predicted_count in range(max_count + 1):
-                    return_log[
-                        f"detection/{self.process}/{cluster_name}/truth_{truth_count}/pred_{predicted_count}_wp"
-                    ] = confusion[truth_count, predicted_count] / denominator
+                    f"detection/{self.process}/{cluster_name}/truth_{truth_count}/expected_predicted_n"
+                ] = predicted_mean
         return return_log
 
     def plot_detection_survival_summary(self):
@@ -907,7 +929,6 @@ class SingleProcessAssignmentMetrics:
         for cluster_name, names, orbit in self.clusters:
             max_count = len(names)
             means = np.zeros((max_count, max_count))
-            wp_rates = np.zeros((max_count, max_count))
             for truth_count in range(1, max_count + 1):
                 hist_by_order = self.detection_survival_metrics[cluster_name][truth_count]
                 for detection_order, hist in enumerate(hist_by_order, start=1):
@@ -917,9 +938,6 @@ class SingleProcessAssignmentMetrics:
                     means[truth_count - 1, detection_order - 1] = (
                         hist * self.bin_centers_score
                     ).sum() / total
-                    wp_rates[truth_count - 1, detection_order - 1] = (
-                        hist[self.bin_centers_score > self.detection_cut].sum() / total
-                    )
 
             fig, ax = plt.subplots(figsize=(1.6 * max_count + 3.2, 1.2 * max_count + 2.6))
             im = ax.imshow(means, origin="lower", vmin=0, vmax=1, cmap="viridis")
@@ -931,17 +949,16 @@ class SingleProcessAssignmentMetrics:
             ax.set_yticklabels([f"Truth {i}{cluster_name}" for i in range(1, max_count + 1)])
             ax.set_xlabel("Detection survival output")
             ax.set_ylabel("Truth count")
-            ax.set_title(f"Detection Survival Summary: {cluster_name} (WP: {self.detection_cut})")
+            ax.set_title(f"Detection Survival Summary: {cluster_name}")
 
             for truth_index in range(max_count):
                 for detection_index in range(max_count):
                     mean_value = means[truth_index, detection_index]
-                    wp_value = wp_rates[truth_index, detection_index]
                     text_color = "white" if mean_value < 0.35 else "black"
                     ax.text(
                         detection_index,
                         truth_index,
-                        f"{mean_value:.2f}\nWP {wp_value:.2f}",
+                        f"{mean_value:.2f}",
                         ha="center",
                         va="center",
                         fontsize=8,
@@ -1185,9 +1202,9 @@ def shared_epoch_end(
             for _, fig in figs.items():
                 plt.close(fig)
 
-            figs = metrics_valid[process].plot_detection_count_confusion()
+            figs = metrics_valid[process].plot_detection_count_distribution()
             wandb.log({
-                f"detection/{process}/{name}/count_confusion": wandb.Image(fig)
+                f"detection/{process}/{name}/count_distribution": wandb.Image(fig)
                 for name, fig in figs.items()
             })
             for _, fig in figs.items():
