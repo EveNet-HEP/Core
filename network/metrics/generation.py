@@ -10,7 +10,6 @@ import matplotlib.pyplot as plt
 from evenet.network.loss.generation import loss as gen_loss
 from evenet.utilities.debug_tool import time_decorator
 from typing import Dict
-import wandb
 import copy
 from scipy.spatial.distance import jensenshannon
 import logging
@@ -453,7 +452,8 @@ def shared_step(
         invisible_padding: int = 0,
         update_metric: bool = True,
         event_weight: torch.Tensor = None,
-        schedules: Union[None, dict] = None
+        schedules: Union[None, dict] = None,
+        debug_nonfinite: bool = True,
 ):
     generation_loss = dict()
 
@@ -488,20 +488,21 @@ def shared_step(
             event_weight=event_weight
         )
 
-        debug_nonfinite_batch(
-            {
-                "predict": generation_result["vector"],
-                "truth": generation_result["truth"],
-                "mask": masking,
-                "weight": event_weight,
-            },
-            batch_dim=0,  # change if your batch axis differs
-            name=f"gen/{generation_target}",
-            logger=logger,
-        )
+        if debug_nonfinite:
+            debug_nonfinite_batch(
+                {
+                    "predict": generation_result["vector"],
+                    "truth": generation_result["truth"],
+                    "mask": masking,
+                    "weight": event_weight,
+                },
+                batch_dim=0,  # change if your batch axis differs
+                name=f"gen/{generation_target}",
+                logger=logger,
+            )
 
         # if generation loss is nan, then print all details
-        if torch.isnan(generation_loss[generation_target]):
+        if debug_nonfinite and torch.isnan(generation_loss[generation_target]):
             logger.warning(
                 f"NaN in generation loss for {generation_target} "
                 f"predict: {generation_result['vector']}, truth: {generation_result['truth']}, "
@@ -544,6 +545,8 @@ def shared_epoch_end(
         metrics_train: GenerationMetrics,
         logger,
 ):
+    import wandb
+
     metrics_valid.reduce_across_gpus()
     if metrics_train:
         metrics_train.reduce_across_gpus()

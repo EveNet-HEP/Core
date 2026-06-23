@@ -2,7 +2,6 @@ from typing import Callable
 
 import numpy as np
 import torch
-import wandb
 from sklearn.metrics import confusion_matrix, roc_curve, auc
 from sklearn.preprocessing import label_binarize
 
@@ -504,7 +503,8 @@ def shared_step(
         event_weight: torch.Tensor = None,
         loss_name: str = "segmentation",
         update_metrics: bool = True,
-        aux_outputs: Optional[dict] = None
+        aux_outputs: Optional[dict] = None,
+        debug_nonfinite: bool = True,
 ):
 
 
@@ -518,18 +518,19 @@ def shared_step(
 
     # Make non-detectable points to be null class as well.
 
-    debug_nonfinite_batch(
-        {
-            "target_classification": target_classification,
-            "target_mask": target_mask,
-            "predict_classification": predict_classification,
-            "predict_mask": predict_mask,
-            "point_cloud_mask": point_cloud_mask,
-            "class_label": class_label,
-            "event_weight": event_weight
-        },
-        batch_dim=0, name=loss_name, logger=logger
-    )
+    if debug_nonfinite:
+        debug_nonfinite_batch(
+            {
+                "target_classification": target_classification,
+                "target_mask": target_mask,
+                "predict_classification": predict_classification,
+                "predict_mask": predict_mask,
+                "point_cloud_mask": point_cloud_mask,
+                "class_label": class_label,
+                "event_weight": event_weight
+            },
+            batch_dim=0, name=loss_name, logger=logger
+        )
 
     mask_loss, dice_loss, cls_loss, mask_loss_aux, dice_loss_aux, cls_loss_aux = seg_loss_fn(
         predict_cls = predict_classification,
@@ -577,6 +578,8 @@ def shared_epoch_end(
     logger,
     prefix: str = "",
 ):
+    import wandb
+
     metrics_valid.reduce_across_gpus()
     if metrics_train is not None:
         metrics_train.reduce_across_gpus()
@@ -616,5 +619,3 @@ def shared_epoch_end(
     metrics_valid.reset()
     if metrics_train is not None:
         metrics_train.reset()
-
-

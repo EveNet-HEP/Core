@@ -2,7 +2,6 @@ from typing import Callable
 
 import numpy as np
 import torch
-import wandb
 from sklearn.metrics import confusion_matrix, roc_curve, auc
 
 
@@ -299,16 +298,18 @@ def shared_step(
         device: torch.device,
         update_metric: bool = True,
         event_weight: torch.Tensor = None,
-        loss_name: str = "classification"
+        loss_name: str = "classification",
+        debug_nonfinite: bool = True,
 ):
-    debug_nonfinite_batch(
-        {
-            "logits": cls_output,
-            "labels": target_classification,
-            "event_weight": event_weight,
-        },
-        batch_dim=0, name=loss_name, logger=logger
-    )
+    if debug_nonfinite:
+        debug_nonfinite_batch(
+            {
+                "logits": cls_output,
+                "labels": target_classification,
+                "event_weight": event_weight,
+            },
+            batch_dim=0, name=loss_name, logger=logger
+        )
 
     cls_loss = cls_loss_fn(
         cls_output,
@@ -339,6 +340,8 @@ def shared_epoch_end(
         module=None,
         prefix: str = "",
 ):
+    import wandb
+
     metrics_valid.reduce_across_gpus()
     if metrics_train:
         metrics_train.reduce_across_gpus()

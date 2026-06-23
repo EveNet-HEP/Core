@@ -127,7 +127,7 @@ class Config:
         # Mapping of dict → list of keys
         path_fields = {
             'platform': ['data_parquet_dir', 'data_parquet_val_dir'],
-            'logger': ['save_dir'],
+            'logger.local': ['save_dir'],
             'options.Training': [
                 'model_checkpoint_save_path',
                 'model_checkpoint_load_path',

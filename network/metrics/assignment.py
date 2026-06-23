@@ -19,7 +19,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 
-import wandb
 from matplotlib.lines import Line2D
 import logging
 
@@ -943,6 +942,8 @@ def shared_epoch_end(
         metrics_train,
         logger,
 ):
+    import wandb
+
     for process in metrics_valid:
         metrics_valid[process].reduce_across_gpus()
     if metrics_train:
@@ -982,7 +983,7 @@ def shared_epoch_end(
                 plt.close(fig)
 
             figs = metrics_valid[process].plot_score(target="detection_score")
-            wandb.log({
+            logger.log({
                 f"assignment_reco_detection/{process}/{name}": wandb.Image(fig)
                 for name, fig in figs.items()
             })
@@ -990,7 +991,7 @@ def shared_epoch_end(
                 plt.close(fig)
 
             figs = metrics_valid[process].plot_score(target="assignment_score")
-            wandb.log({
+            logger.log({
                 f"assignment_score/{process}/{name}": wandb.Image(fig)
                 for name, fig in figs.items()
             })
