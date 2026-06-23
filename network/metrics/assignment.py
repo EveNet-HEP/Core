@@ -318,21 +318,21 @@ class SingleProcessAssignmentMetrics:
 
         self.score2d_metrics = dict(
             {f"{i + 1}{cluster_name}": {
-                "correct": np.zeros((self.num_score2d_bins, self.num_score2d_bins)),
-                "wrong": np.zeros((self.num_score2d_bins, self.num_score2d_bins)),
+                "correct": np.zeros((self.num_score2d_bins, self.num_score2d_bins), dtype=np.int64),
+                "wrong": np.zeros((self.num_score2d_bins, self.num_score2d_bins), dtype=np.int64),
             }
                 for cluster_name, particle_name, orbit in self.clusters
                 for i in range(len(particle_name))
             })
 
         self.detection_count_confusion = {
-            cluster_name: np.zeros((len(particle_name) + 1, len(particle_name) + 1))
+            cluster_name: np.zeros((len(particle_name) + 1, len(particle_name) + 1), dtype=np.int64)
             for cluster_name, particle_name, orbit in self.clusters
         }
 
         self.detection_survival_metrics = {
             cluster_name: {
-                truth_count: np.zeros((len(particle_name), self.num_bins))
+                truth_count: np.zeros((len(particle_name), self.num_bins), dtype=np.int64)
                 for truth_count in range(1, len(particle_name) + 1)
             }
             for cluster_name, particle_name, orbit in self.clusters
@@ -443,7 +443,7 @@ class SingleProcessAssignmentMetrics:
                 predict_count_wp.detach().cpu().numpy(),
                 bins=[count_bins, count_bins]
             )
-            self.detection_count_confusion[cluster_name] += confusion
+            self.detection_count_confusion[cluster_name] += confusion.astype(np.int64, copy=False)
 
             for num_resonance in range(len(names)):
                 truth_mask = (truth_count == (num_resonance + 1))
@@ -490,7 +490,7 @@ class SingleProcessAssignmentMetrics:
                             detection_correct.detach().cpu().numpy(),
                             bins=[self.bins_score2d, self.bins_score2d]
                         )
-                        self.score2d_metrics[hist_name]["correct"] += hist2d
+                        self.score2d_metrics[hist_name]["correct"] += hist2d.astype(np.int64, copy=False)
 
                     if prediction_local.size()[0] > 0:
                         reco_mass_correct = reconstruct_mass_peak(
@@ -517,7 +517,7 @@ class SingleProcessAssignmentMetrics:
                             detection_false.detach().cpu().numpy(),
                             bins=[self.bins_score2d, self.bins_score2d]
                         )
-                        self.score2d_metrics[hist_name]["wrong"] += hist2d
+                        self.score2d_metrics[hist_name]["wrong"] += hist2d.astype(np.int64, copy=False)
                     if (prediction_false.size()[0] > 0) and (prediction_false >= 0).all():
                         reco_mass_false = reconstruct_mass_peak(
                             jet[~correct_local], prediction_false, input_mask[~correct_local]
