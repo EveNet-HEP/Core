@@ -21,8 +21,6 @@ from scipy.optimize import curve_fit
 
 import wandb
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
-from matplotlib.colors import LogNorm
 import logging
 
 logger = logging.getLogger(__name__)
@@ -283,8 +281,6 @@ class SingleProcessAssignmentMetrics:
 
         self.bins_score = np.linspace(0, 1, self.num_bins + 1)
         self.bin_centers_score = 0.5 * (self.bins_score[:-1] + self.bins_score[1:])
-        self.num_score2d_bins = 50
-        self.bins_score2d = np.linspace(0, 1, self.num_score2d_bins + 1)
 
         self.truth_metrics = dict(
             {f"{i + 1}{cluster_name}": {
@@ -311,15 +307,6 @@ class SingleProcessAssignmentMetrics:
                 "mass": np.zeros(self.num_bins),
                 "detection_score": np.zeros(self.num_bins),
                 "assignment_score": np.zeros(self.num_bins),
-            }
-                for cluster_name, particle_name, orbit in self.clusters
-                for i in range(len(particle_name))
-            })
-
-        self.score2d_metrics = dict(
-            {f"{i + 1}{cluster_name}": {
-                "correct": np.zeros((self.num_score2d_bins, self.num_score2d_bins), dtype=np.int64),
-                "wrong": np.zeros((self.num_score2d_bins, self.num_score2d_bins), dtype=np.int64),
             }
                 for cluster_name, particle_name, orbit in self.clusters
                 for i in range(len(particle_name))
@@ -484,13 +471,6 @@ class SingleProcessAssignmentMetrics:
                     predict_correct = prediction_local[correct_local]
                     detection_correct = detection_local[correct_local]
                     assign_score_correct = assign_score_local[correct_local]
-                    if detection_correct.size()[0] > 0:
-                        hist2d, _, _ = np.histogram2d(
-                            assign_score_correct.detach().cpu().numpy(),
-                            detection_correct.detach().cpu().numpy(),
-                            bins=[self.bins_score2d, self.bins_score2d]
-                        )
-                        self.score2d_metrics[hist_name]["correct"] += hist2d.astype(np.int64, copy=False)
 
                     if prediction_local.size()[0] > 0:
                         reco_mass_correct = reconstruct_mass_peak(
@@ -511,13 +491,6 @@ class SingleProcessAssignmentMetrics:
                     prediction_false = prediction_local[~correct_local]
                     detection_false = detection_local[~correct_local]
                     assign_score_false = assign_score_local[~correct_local]
-                    if detection_false.size()[0] > 0:
-                        hist2d, _, _ = np.histogram2d(
-                            assign_score_false.detach().cpu().numpy(),
-                            detection_false.detach().cpu().numpy(),
-                            bins=[self.bins_score2d, self.bins_score2d]
-                        )
-                        self.score2d_metrics[hist_name]["wrong"] += hist2d.astype(np.int64, copy=False)
                     if (prediction_false.size()[0] > 0) and (prediction_false >= 0).all():
                         reco_mass_false = reconstruct_mass_peak(
                             jet[~correct_local], prediction_false, input_mask[~correct_local]
@@ -577,10 +550,6 @@ class SingleProcessAssignmentMetrics:
             for key in hist.keys():
                 self.predict_metrics_wrong[name][key] = np.zeros(self.num_bins)
 
-        for name, hist in self.score2d_metrics.items():
-            for key in hist.keys():
-                self.score2d_metrics[name][key] = np.zeros((self.num_score2d_bins, self.num_score2d_bins))
-
         for cluster_name, confusion in self.detection_count_confusion.items():
             self.detection_count_confusion[cluster_name] = np.zeros_like(confusion)
 
@@ -614,12 +583,6 @@ class SingleProcessAssignmentMetrics:
                     tensor = torch.tensor(hist[key], dtype=torch.long, device=self.device)
                     torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
                     self.predict_metrics_wrong[name][key] = tensor.cpu().numpy()
-
-            for name, hist in self.score2d_metrics.items():
-                for key in hist.keys():
-                    tensor = torch.tensor(hist[key], dtype=torch.long, device=self.device)
-                    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
-                    self.score2d_metrics[name][key] = tensor.cpu().numpy()
 
             for cluster_name, confusion in self.detection_count_confusion.items():
                 tensor = torch.tensor(confusion, dtype=torch.long, device=self.device)
@@ -910,101 +873,81 @@ class SingleProcessAssignmentMetrics:
             return_plot[cluster_name] = fig
         return return_plot
 
-    def plot_score2d_density(self):
+    def detection_count_summary_log(self):
+        return_log = dict()
+        for cluster_name, confusion in self.detection_count_confusion.items():
+            row_sum = confusion.sum(axis=1)
+            max_count = confusion.shape[0] - 1
+            for truth_count in range(max_count + 1):
+                denominator = row_sum[truth_count]
+                if denominator <= 0:
+                    continue
+
+                exact_rate = confusion[truth_count, truth_count] / denominator
+                under_rate = confusion[truth_count, :truth_count].sum() / denominator
+                over_rate = confusion[truth_count, truth_count + 1:].sum() / denominator
+                return_log[
+                    f"detection/{self.process}/{cluster_name}/truth_{truth_count}/exact_wp"
+                ] = exact_rate
+                return_log[
+                    f"detection/{self.process}/{cluster_name}/truth_{truth_count}/under_wp"
+                ] = under_rate
+                return_log[
+                    f"detection/{self.process}/{cluster_name}/truth_{truth_count}/over_wp"
+                ] = over_rate
+
+                for predicted_count in range(max_count + 1):
+                    return_log[
+                        f"detection/{self.process}/{cluster_name}/truth_{truth_count}/pred_{predicted_count}_wp"
+                    ] = confusion[truth_count, predicted_count] / denominator
+        return return_log
+
+    def plot_detection_survival_summary(self):
         return_plot = dict()
         for cluster_name, names, orbit in self.clusters:
-            num_panels = len(names)
-            fig, axes = plt.subplots(
-                1,
-                num_panels,
-                figsize=(4.5 * num_panels, 4),
-                sharex=True,
-                sharey=True,
-                squeeze=False,
-            )
-            axes = axes[0]
-
-            for index, ax in enumerate(axes):
-                hist_name = f"{index + 1}{cluster_name}"
-                correct = np.ma.masked_less_equal(self.score2d_metrics[hist_name]["correct"].T, 0)
-                wrong = np.ma.masked_less_equal(self.score2d_metrics[hist_name]["wrong"].T, 0)
-                max_density = max(
-                    self.score2d_metrics[hist_name]["correct"].max(),
-                    self.score2d_metrics[hist_name]["wrong"].max(),
-                )
-                norm = LogNorm(vmin=1, vmax=max(2, max_density))
-
-                ax.imshow(
-                    wrong,
-                    extent=[0, 1, 0, 1],
-                    origin="lower",
-                    aspect="auto",
-                    cmap="Oranges",
-                    norm=norm,
-                    alpha=0.65,
-                )
-                ax.imshow(
-                    correct,
-                    extent=[0, 1, 0, 1],
-                    origin="lower",
-                    aspect="auto",
-                    cmap="Blues",
-                    norm=norm,
-                    alpha=0.65,
-                )
-                ax.axhline(self.detection_cut, color="black", linestyle="--", linewidth=1)
-                ax.set_title(f"Truth N = {index + 1}")
-                ax.set_xlabel("Assignment score")
-                ax.grid(True, linestyle=":", linewidth=0.5, alpha=0.5)
-
-            axes[0].set_ylabel("Detection score")
-            legend_handles = [
-                Patch(facecolor=plt.cm.Blues(0.75), alpha=0.65, label="Correct assign"),
-                Patch(facecolor=plt.cm.Oranges(0.75), alpha=0.65, label="Wrong assign"),
-                Line2D([0], [0], color="black", linestyle="--", linewidth=1,
-                       label=f"Detection WP: {self.detection_cut}"),
-            ]
-            axes[-1].legend(handles=legend_handles, loc="lower right")
-            fig.suptitle(f"Assignment Score vs Detection Score: {cluster_name}")
-            fig.tight_layout()
-            return_plot[cluster_name] = fig
-        return return_plot
-
-    def plot_detection_survival_distribution(self):
-        return_plot = dict()
-        for cluster_name, names, orbit in self.clusters:
-            num_panels = len(names)
-            fig, axes = plt.subplots(
-                1,
-                num_panels,
-                figsize=(4.5 * num_panels, 4),
-                sharex=True,
-                sharey=True,
-                squeeze=False,
-            )
-            axes = axes[0]
-            bin_widths = np.diff(self.bins_score)
-
-            for truth_count, ax in enumerate(axes, start=1):
+            max_count = len(names)
+            means = np.zeros((max_count, max_count))
+            wp_rates = np.zeros((max_count, max_count))
+            for truth_count in range(1, max_count + 1):
                 hist_by_order = self.detection_survival_metrics[cluster_name][truth_count]
                 for detection_order, hist in enumerate(hist_by_order, start=1):
-                    density = hist / np.maximum(1.0, hist.sum() * bin_widths)
-                    ax.step(
-                        self.bin_centers_score,
-                        density,
-                        where="mid",
-                        linewidth=1.8,
-                        label=f"P(N >= {detection_order})",
+                    total = hist.sum()
+                    if total <= 0:
+                        continue
+                    means[truth_count - 1, detection_order - 1] = (
+                        hist * self.bin_centers_score
+                    ).sum() / total
+                    wp_rates[truth_count - 1, detection_order - 1] = (
+                        hist[self.bin_centers_score > self.detection_cut].sum() / total
                     )
 
-                ax.axvline(self.detection_cut, color="black", linestyle="--", linewidth=1)
-                ax.set_title(f"Truth N = {truth_count}")
-                ax.set_xlabel("Probability")
-                ax.grid(True, linestyle=":", linewidth=0.5, alpha=0.5)
+            fig, ax = plt.subplots(figsize=(1.6 * max_count + 3.2, 1.2 * max_count + 2.6))
+            im = ax.imshow(means, origin="lower", vmin=0, vmax=1, cmap="viridis")
+            fig.colorbar(im, ax=ax, label="Mean survival probability")
 
-            axes[0].set_ylabel("Density")
-            axes[-1].legend(loc="best")
-            fig.suptitle(f"Detection Survival Probability: {cluster_name}")
+            ax.set_xticks(np.arange(max_count))
+            ax.set_yticks(np.arange(max_count))
+            ax.set_xticklabels([f"P(N>={i})" for i in range(1, max_count + 1)])
+            ax.set_yticklabels([f"Truth {i}{cluster_name}" for i in range(1, max_count + 1)])
+            ax.set_xlabel("Detection survival output")
+            ax.set_ylabel("Truth count")
+            ax.set_title(f"Detection Survival Summary: {cluster_name} (WP: {self.detection_cut})")
+
+            for truth_index in range(max_count):
+                for detection_index in range(max_count):
+                    mean_value = means[truth_index, detection_index]
+                    wp_value = wp_rates[truth_index, detection_index]
+                    text_color = "white" if mean_value < 0.35 else "black"
+                    ax.text(
+                        detection_index,
+                        truth_index,
+                        f"{mean_value:.2f}\nWP {wp_value:.2f}",
+                        ha="center",
+                        va="center",
+                        fontsize=8,
+                        color=text_color,
+                    )
+
             fig.tight_layout()
             return_plot[cluster_name] = fig
         return return_plot
@@ -1206,6 +1149,7 @@ def shared_epoch_end(
 
             logs = metrics_valid[process].summary_log()
             logger.log(logs)
+            logger.log(metrics_valid[process].detection_count_summary_log())
 
             # if metrics_train[process] is not None:
             #     training_logs = metrics_train[process].summary_log()
@@ -1233,14 +1177,6 @@ def shared_epoch_end(
             for _, fig in figs.items():
                 plt.close(fig)
 
-            figs = metrics_valid[process].plot_score(target="detection_score")
-            wandb.log({
-                f"assignment_reco_detection/{process}/{name}": wandb.Image(fig)
-                for name, fig in figs.items()
-            })
-            for _, fig in figs.items():
-                plt.close(fig)
-
             figs = metrics_valid[process].plot_score(target="assignment_score")
             wandb.log({
                 f"assignment_score/{process}/{name}": wandb.Image(fig)
@@ -1251,23 +1187,15 @@ def shared_epoch_end(
 
             figs = metrics_valid[process].plot_detection_count_confusion()
             wandb.log({
-                f"assignment_detection_count/{process}/{name}": wandb.Image(fig)
+                f"detection/{process}/{name}/count_confusion": wandb.Image(fig)
                 for name, fig in figs.items()
             })
             for _, fig in figs.items():
                 plt.close(fig)
 
-            figs = metrics_valid[process].plot_detection_survival_distribution()
+            figs = metrics_valid[process].plot_detection_survival_summary()
             wandb.log({
-                f"assignment_detection_survival/{process}/{name}": wandb.Image(fig)
-                for name, fig in figs.items()
-            })
-            for _, fig in figs.items():
-                plt.close(fig)
-
-            figs = metrics_valid[process].plot_score2d_density()
-            wandb.log({
-                f"assignment_score2d/{process}/{name}": wandb.Image(fig)
+                f"detection/{process}/{name}/survival_mean": wandb.Image(fig)
                 for name, fig in figs.items()
             })
             for _, fig in figs.items():
