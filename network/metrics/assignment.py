@@ -317,6 +317,11 @@ class SingleProcessAssignmentMetrics:
             for cluster_name, particle_name, orbit in self.clusters
         }
 
+        self.detection_count_probability_sum = {
+            cluster_name: np.zeros((len(particle_name) + 1, len(particle_name) + 1), dtype=np.float64)
+            for cluster_name, particle_name, orbit in self.clusters
+        }
+
         self.detection_survival_metrics = {
             cluster_name: {
                 truth_count: np.zeros((len(particle_name), self.num_bins), dtype=np.int64)
@@ -439,6 +444,15 @@ class SingleProcessAssignmentMetrics:
                 bins=[count_bins, count_bins]
             )
             self.detection_count_confusion[cluster_name] += confusion.astype(np.int64, copy=False)
+            truth_count_np = truth_count.detach().cpu().numpy()
+            count_probabilities_np = count_probabilities.detach().cpu().numpy()
+            for count_value in range(len(names) + 1):
+                count_mask = truth_count_np == count_value
+                if not np.any(count_mask):
+                    continue
+                self.detection_count_probability_sum[cluster_name][count_value] += (
+                    count_probabilities_np[:, count_mask].sum(axis=1)
+                )
 
             for num_resonance in range(len(names)):
                 truth_mask = (truth_count == (num_resonance + 1))
@@ -561,6 +575,9 @@ class SingleProcessAssignmentMetrics:
         for cluster_name, confusion in self.detection_count_confusion.items():
             self.detection_count_confusion[cluster_name] = np.zeros_like(confusion)
 
+        for cluster_name, probability_sum in self.detection_count_probability_sum.items():
+            self.detection_count_probability_sum[cluster_name] = np.zeros_like(probability_sum)
+
         for cluster_name, truth_count_metrics in self.detection_survival_metrics.items():
             for truth_count, hist in truth_count_metrics.items():
                 self.detection_survival_metrics[cluster_name][truth_count] = np.zeros_like(hist)
@@ -596,6 +613,11 @@ class SingleProcessAssignmentMetrics:
                 tensor = torch.tensor(confusion, dtype=torch.long, device=self.device)
                 torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
                 self.detection_count_confusion[cluster_name] = tensor.cpu().numpy()
+
+            for cluster_name, probability_sum in self.detection_count_probability_sum.items():
+                tensor = torch.tensor(probability_sum, dtype=torch.float64, device=self.device)
+                torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+                self.detection_count_probability_sum[cluster_name] = tensor.cpu().numpy()
 
             for cluster_name, truth_count_metrics in self.detection_survival_metrics.items():
                 for truth_count, hist in truth_count_metrics.items():
@@ -850,6 +872,12 @@ class SingleProcessAssignmentMetrics:
                 out=np.zeros_like(confusion, dtype=float),
                 where=row_sum > 0,
             )
+            soft_pmf = np.divide(
+                self.detection_count_probability_sum[cluster_name],
+                np.maximum(row_sum, 1),
+                out=np.zeros_like(self.detection_count_probability_sum[cluster_name], dtype=float),
+                where=row_sum > 0,
+            )
 
             fig, (ax_matrix, ax_pdf) = plt.subplots(
                 2,
@@ -886,21 +914,21 @@ class SingleProcessAssignmentMetrics:
                 total = row_sum[truth_count, 0]
                 if total <= 0:
                     continue
-                expected_count = (pmf[truth_count] * predicted_counts).sum()
+                expected_count = (soft_pmf[truth_count] * predicted_counts).sum()
                 ax_pdf.step(
                     predicted_counts,
-                    pmf[truth_count],
+                    soft_pmf[truth_count],
                     where="mid",
                     linewidth=2,
                     marker="o",
-                    label=f"Truth {truth_count}{cluster_name}: E[N]={expected_count:.2f}",
+                    label=f"Truth {truth_count}{cluster_name}: soft E[N]={expected_count:.2f}",
                 )
 
             ax_pdf.set_xticks(predicted_counts)
             ax_pdf.set_ylim(0, 1)
-            ax_pdf.set_xlabel("Predicted N (argmax)")
-            ax_pdf.set_ylabel("P(predicted N | truth N)")
-            ax_pdf.set_title("Count Distribution by Truth")
+            ax_pdf.set_xlabel("N")
+            ax_pdf.set_ylabel("Mean predicted P(N)")
+            ax_pdf.set_title("Soft Count Probability by Truth")
             ax_pdf.grid(True, linestyle=":", linewidth=0.5, alpha=0.5)
             ax_pdf.legend(loc="best", fontsize=8)
             fig.tight_layout()
@@ -913,12 +941,13 @@ class SingleProcessAssignmentMetrics:
             row_sum = confusion.sum(axis=1)
             max_count = confusion.shape[0] - 1
             predicted_counts = np.arange(max_count + 1)
+            probability_sum = self.detection_count_probability_sum[cluster_name]
             for truth_count in range(max_count + 1):
                 denominator = row_sum[truth_count]
                 if denominator <= 0:
                     continue
 
-                predicted_mean = (confusion[truth_count] * predicted_counts).sum() / denominator
+                predicted_mean = (probability_sum[truth_count] * predicted_counts).sum() / denominator
                 return_log[
                     f"detection/{self.process}/{cluster_name}/truth_{truth_count}/expected_predicted_n"
                 ] = predicted_mean
