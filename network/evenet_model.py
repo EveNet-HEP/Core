@@ -386,7 +386,7 @@ class EveNetModel(nn.Module):
         if 'x_invisible' in x and self.include_neutrino_generation:
             invisible_point_cloud = x['x_invisible']
         else:
-            invisible_point_cloud = torch.zeros(B, 1, self.invisible_input_dim, device=input_point_cloud.device)
+            invisible_point_cloud = torch.zeros(B, 1, self.sequential_input_dim, device=input_point_cloud.device)
 
         invisible_point_cloud_mask = x['x_invisible_mask'].unsqueeze(
             -1) if 'x_invisible_mask' in x else torch.zeros_like(input_point_cloud_mask[:, [0], :]).bool()
