@@ -104,7 +104,10 @@ class ProgressiveTaskScheduler:
         t = np.clip(t, 0.0, 1.0)
         # Smooth cosine transition
         # print(f"Transition factor (cosine): {0.5 * (1.0 - np.cos(np.pi * t)):.3f}")
-        return 0.5 * (1.0 - np.cos(np.pi * t))  # smooth
+        # Keep the public scheduler output in native Python scalar types. NumPy
+        # scalars leak into comparisons as ``np.bool_`` and break strict JSON
+        # diagnostics even though the numerical value itself is valid.
+        return float(0.5 * (1.0 - np.cos(np.pi * t)))  # smooth
 
     def get_current_parameters(self, epoch: int, batch_idx: int, batches_per_epoch: int):
         """
@@ -117,9 +120,9 @@ class ProgressiveTaskScheduler:
         weights = {}
         train_parameters = {}
         for task, (start, end) in stage["loss_weights"].items():
-            weights[task] = (1 - t) * start + t * end
+            weights[task] = float((1 - t) * start + t * end)
         for task, (start, end) in stage["train_parameters"].items():
-            train_parameters[task] = (1 - t) * start + t * end
+            train_parameters[task] = float((1 - t) * start + t * end)
 
         # print(f"Epoch {epoch}, Batch {batch_idx}/{batches_per_epoch} -> Stage: {stage['name']}, ep: {ep:.3f}")
 
