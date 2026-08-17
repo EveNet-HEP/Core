@@ -74,7 +74,7 @@ class Normalizer(nn.Module):
         :param index: index of features to apply inverse transformation
         :return: tensor (batch_size, num_objects, num_features)
         """
-        if remove_padding:
+        if remove_padding and self.padding > 0:
             current_mean = self.mean[:-self.padding]
             current_std = self.std[:-self.padding]
         else:
