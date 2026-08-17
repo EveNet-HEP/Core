@@ -51,18 +51,21 @@ def maximal_prediction(predictions: List[torch.Tensor]) -> Tuple[int, int, float
 
 
 def mask_jet(data: torch.Tensor, num_partons: int, max_jets: int, index: torch.Tensor, value: float):
+    valid = index >= 0  # Ignore padded jet indices from lower-prong assignments.
     batch_size = data.shape[0]
+    batch_index = torch.arange(batch_size, device = data.device)[valid]
+    index = index[valid]
     if num_partons == 1:
-        data[torch.arange(batch_size), index] = value
+        data[batch_index, index] = value
     elif num_partons == 2:
         data = data.reshape((batch_size, max_jets, max_jets))
-        data[torch.arange(batch_size), index, :] = value
-        data[torch.arange(batch_size), :, index] = value
+        data[batch_index, index, :] = value
+        data[batch_index, :, index] = value
     elif num_partons == 3:
         data = data.reshape((batch_size, max_jets, max_jets, max_jets))
-        data[torch.arange(batch_size), index, :, :] = value
-        data[torch.arange(batch_size), :, index, :] = value
-        data[torch.arange(batch_size), :, :, index] = value
+        data[batch_index, index, :, :] = value
+        data[batch_index, :, index, :] = value
+        data[batch_index, :, :, index] = value
     else:
         raise NotImplementedError("num_partons > 3 not yet implemented in PyTorch version")
 
@@ -88,7 +91,7 @@ def extract_prediction(predictions: List[torch.Tensor], num_partons: torch.Tenso
 
         for i in range(num_targets):
             predictions[i] = predictions[i] + (torch.where(best_prediction == i, float_neg_inf, 0)).unsqueeze(1)
-            for i_parton in range(num_partons[i].item()):
+            for i_parton in range(max_partons):
                 jet = best_jets.reshape(batch_size, -1)[:, i_parton] # (batch_size,)
                 mask_jet(predictions[i], num_partons[i].item(), max_jets, jet, float_neg_inf)
 

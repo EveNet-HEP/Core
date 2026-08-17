@@ -293,6 +293,16 @@ def loss_single_process(
     ## Detection Loss ##
     ####################
 
+    base_particle_balance_weight = torch.ones_like(targets_mask[0], dtype=torch.float32)
+    masks_for_balance = torch.stack(targets_mask).int()
+
+    if particle_index_tensor is not None:
+        class_indices = (masks_for_balance * particle_index_tensor.to(masks_for_balance.device).unsqueeze(1)).sum(0).int()
+        base_particle_balance_weight = (
+                base_particle_balance_weight *
+                particle_weights_tensor.to(masks_for_balance.device)[class_indices]
+        )
+
     detections = detections
     detections_target = targets_mask
     detection_losses = []
@@ -301,7 +311,7 @@ def loss_single_process(
     for symmetry_group in event_permutations:
         for symmetry_element in symmetry_group:
             symmetry_element = np.array(symmetry_element)
-            detection = detections[symmetry_element[0]]
+            detection = detections[symmetry_element[0]] # All the symmetry group detection/assignment outputs are just duplicated
             detection_target = torch.stack([detections_target[symmetry_index] for symmetry_index in symmetry_element])
             detection_target = detection_target.sum(0).long()
 
@@ -322,13 +332,15 @@ def loss_single_process(
 
     process_masking = torch.stack(process_masking).float()
     process_weighting = torch.stack(process_weighting).float()
+    detection_particle_balance_weight = base_particle_balance_weight.unsqueeze(0)
 
     if event_weight is not None:
-        detection_losses = torch.stack(detection_losses) * process_masking * process_weighting * event_weight.view(-1, *([1] * (process_masking.dim() - 1)))
-        valid_process = torch.sum(process_masking * process_weighting * event_weight.view(-1, *([1] * (process_masking.dim() - 1))))
+        event_balance_weight = event_weight.view(-1, *([1] * (process_masking.dim() - 1)))
+        detection_losses = torch.stack(detection_losses) * process_masking * process_weighting * event_balance_weight * detection_particle_balance_weight
+        valid_process = torch.sum(process_masking * process_weighting * event_balance_weight * detection_particle_balance_weight)
     else:
-        detection_losses = torch.stack(detection_losses) * process_masking * process_weighting
-        valid_process = torch.sum(process_masking * process_weighting)
+        detection_losses = torch.stack(detection_losses) * process_masking * process_weighting * detection_particle_balance_weight
+        valid_process = torch.sum(process_masking * process_weighting * detection_particle_balance_weight)
 
     if valid_process > 0:
         detection_loss = torch.sum(detection_losses) / valid_process
@@ -351,15 +363,10 @@ def loss_single_process(
         focal_gamma
     )
 
-    particle_balance_weight = torch.ones_like(symmetric_losses)
-    masks_for_balance = torch.stack(targets_mask).int()
-
-    if particle_balance_weight is not None and particle_index_tensor is not None:
-        class_indices = (masks_for_balance * particle_index_tensor.to(masks_for_balance.device).unsqueeze(1)).sum(0).int()
-        particle_balance_weight *= particle_weights_tensor.to(masks_for_balance.device)[class_indices]
+    particle_balance_weight = base_particle_balance_weight.to(symmetric_losses.device)
 
     if process_weight[0] is not None:
-        particle_balance_weight *= process_weight[0].unsqueeze(0)
+        particle_balance_weight = particle_balance_weight * process_weight[0]
 
     targets_mask_finite = torch.stack(targets_mask).float()
     if not torch.isfinite(symmetric_losses).all():

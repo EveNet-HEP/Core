@@ -123,17 +123,45 @@ def predict(assignments: List[Tensor],
             product_symbolic_groups,
             event_permutations):
     device = assignments[0].device
+    scaled_assignments = list(assignments)
+    for symmetry_group in event_permutations:
+        for symmetry_element in symmetry_group:
+            symmetry_element = np.asarray(symmetry_element)
+            detection_prob = torch.softmax(
+                detections[symmetry_element[0]],
+                dim=-1,
+            )
+            survival = detection_prob[:, 1:].flip(-1).cumsum(-1).flip(-1)
+            expected_count = survival[:, :len(symmetry_element)].sum(-1)
+            expected_count = expected_count.clamp_min(1e-6)
+            for index in symmetry_element:
+                assignment = assignments[index]
+                broadcast_shape = (-1,) + (1,) * (assignment.ndim - 1)
+
+                scaled_assignments[index] = (
+                        assignment
+                        + expected_count.log().view(broadcast_shape)
+                )
+
+    selection_assignments = [
+        assignment + np.log(symmetries.order())
+        for assignment, symmetries in zip(
+            scaled_assignments,
+            product_symbolic_groups.values(),
+        )
+    ]
+
     assignments_indices = extract_predictions(
         [
             torch.nan_to_num(assignment, nan=-float('inf'))
-            for assignment in assignments
+            for assignment in selection_assignments
         ]
     )
-
     assignment_probabilities = []
     dummy_index = torch.arange(assignments_indices[0].shape[0])
+
     for assignment_probability, assignment, symmetries in zip(
-            assignments,
+            scaled_assignments,
             assignments_indices,
             product_symbolic_groups.values()
     ):
@@ -157,8 +185,9 @@ def predict(assignments: List[Tensor],
             symmetry_element = np.sort(np.array(symmetry_element))
             detection_result = detections[symmetry_element[0]]
             softmax = torch.nn.Softmax(dim=-1)
-
             detection_prob = softmax(detection_result)
+            # survival[:, r - 1] = P(N >= r)
+            survival = detection_prob[:, 1:].flip(-1).cumsum(-1).flip(-1)
 
             assignment_tmp = torch.stack([assignments_indices[element] for element in symmetry_element])
             assignment_probability_tmp = torch.stack(
@@ -170,13 +199,10 @@ def predict(assignments: List[Tensor],
             assignment_sorted = torch.gather(assignment_tmp, dim=0, index=expanded_sort_index)
             assignment_probability = torch.gather(assignment_probability_tmp, dim=0, index=sort_index)
 
-            init_probabilities = torch.ones_like(assignment_probability[0])
             for iorder in range(len(symmetry_element)):
                 final_assignments_indices.append(assignment_sorted[iorder])
                 final_assignments_probabilities.append(assignment_probability[iorder])
-                detections_probabilities = 1.0 - (detection_prob[:, iorder] / init_probabilities)
-                init_probabilities = detections_probabilities
-                final_detections_probabilities.append(detections_probabilities)
+                final_detections_probabilities.append(survival[:, iorder])
 
     return {
         "best_indices": final_assignments_indices,
@@ -286,6 +312,24 @@ class SingleProcessAssignmentMetrics:
                 for i in range(len(particle_name))
             })
 
+        self.detection_count_confusion = {
+            cluster_name: np.zeros((len(particle_name) + 1, len(particle_name) + 1), dtype=np.int64)
+            for cluster_name, particle_name, orbit in self.clusters
+        }
+
+        self.detection_count_probability_sum = {
+            cluster_name: np.zeros((len(particle_name) + 1, len(particle_name) + 1), dtype=np.float64)
+            for cluster_name, particle_name, orbit in self.clusters
+        }
+
+        self.detection_survival_metrics = {
+            cluster_name: {
+                truth_count: np.zeros((len(particle_name), self.num_bins), dtype=np.int64)
+                for truth_count in range(1, len(particle_name) + 1)
+            }
+            for cluster_name, particle_name, orbit in self.clusters
+        }
+
         self.train_metrics_correct = None
         self.train_metrics_wrong = None
 
@@ -384,9 +428,42 @@ class SingleProcessAssignmentMetrics:
             )
             correct_reco = torch.stack([correct_assigned[iorbit] for iorbit in list(sorted(orbit))], dim=0)
 
+            count_probabilities = torch.cat(
+                [
+                    1 - predict_detection[0:1],
+                    predict_detection[:-1] - predict_detection[1:],
+                    predict_detection[-1:],
+                ],
+                dim=0,
+            ).clamp_min(0)
+            predict_count = torch.argmax(count_probabilities, dim=0).long()
+            count_bins = np.arange(len(names) + 2) - 0.5
+            confusion, _, _ = np.histogram2d(
+                truth_count.detach().cpu().numpy(),
+                predict_count.detach().cpu().numpy(),
+                bins=[count_bins, count_bins]
+            )
+            self.detection_count_confusion[cluster_name] += confusion.astype(np.int64, copy=False)
+            truth_count_np = truth_count.detach().cpu().numpy()
+            count_probabilities_np = count_probabilities.detach().cpu().numpy()
+            for count_value in range(len(names) + 1):
+                count_mask = truth_count_np == count_value
+                if not np.any(count_mask):
+                    continue
+                self.detection_count_probability_sum[cluster_name][count_value] += (
+                    count_probabilities_np[:, count_mask].sum(axis=1)
+                )
+
             for num_resonance in range(len(names)):
                 truth_mask = (truth_count == (num_resonance + 1))
                 hist_name = f"{num_resonance + 1}{cluster_name}"
+                for detection_order in range(len(names)):
+                    hist, _ = np.histogram(
+                        predict_detection[detection_order, truth_mask].detach().cpu().numpy(),
+                        bins=self.bins_score,
+                    )
+                    self.detection_survival_metrics[cluster_name][num_resonance + 1][detection_order] += hist
+
                 for local_resonance in range(len(names)):
                     truth_local = truth[local_resonance, :, :]
                     truth_mask_local = truth_mask
@@ -495,6 +572,16 @@ class SingleProcessAssignmentMetrics:
             for key in hist.keys():
                 self.predict_metrics_wrong[name][key] = np.zeros(self.num_bins)
 
+        for cluster_name, confusion in self.detection_count_confusion.items():
+            self.detection_count_confusion[cluster_name] = np.zeros_like(confusion)
+
+        for cluster_name, probability_sum in self.detection_count_probability_sum.items():
+            self.detection_count_probability_sum[cluster_name] = np.zeros_like(probability_sum)
+
+        for cluster_name, truth_count_metrics in self.detection_survival_metrics.items():
+            for truth_count, hist in truth_count_metrics.items():
+                self.detection_survival_metrics[cluster_name][truth_count] = np.zeros_like(hist)
+
         for name in self.full_log:
             for key in self.full_log[name].keys():
                 self.full_log[name][key] = 0
@@ -521,6 +608,22 @@ class SingleProcessAssignmentMetrics:
                     tensor = torch.tensor(hist[key], dtype=torch.long, device=self.device)
                     torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
                     self.predict_metrics_wrong[name][key] = tensor.cpu().numpy()
+
+            for cluster_name, confusion in self.detection_count_confusion.items():
+                tensor = torch.tensor(confusion, dtype=torch.long, device=self.device)
+                torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+                self.detection_count_confusion[cluster_name] = tensor.cpu().numpy()
+
+            for cluster_name, probability_sum in self.detection_count_probability_sum.items():
+                tensor = torch.tensor(probability_sum, dtype=torch.float64, device=self.device)
+                torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+                self.detection_count_probability_sum[cluster_name] = tensor.cpu().numpy()
+
+            for cluster_name, truth_count_metrics in self.detection_survival_metrics.items():
+                for truth_count, hist in truth_count_metrics.items():
+                    tensor = torch.tensor(hist, dtype=torch.long, device=self.device)
+                    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+                    self.detection_survival_metrics[cluster_name][truth_count] = tensor.cpu().numpy()
 
             for name, log in self.full_log.items():
                 for key in log.keys():
@@ -757,6 +860,144 @@ class SingleProcessAssignmentMetrics:
             )
         return return_plot
 
+    def plot_detection_count_distribution(self):
+        return_plot = dict()
+        for cluster_name, confusion in self.detection_count_confusion.items():
+            max_count = confusion.shape[0] - 1
+            predicted_counts = np.arange(max_count + 1)
+            row_sum = confusion.sum(axis=1, keepdims=True)
+            pmf = np.divide(
+                confusion,
+                np.maximum(row_sum, 1),
+                out=np.zeros_like(confusion, dtype=float),
+                where=row_sum > 0,
+            )
+            soft_pmf = np.divide(
+                self.detection_count_probability_sum[cluster_name],
+                np.maximum(row_sum, 1),
+                out=np.zeros_like(self.detection_count_probability_sum[cluster_name], dtype=float),
+                where=row_sum > 0,
+            )
+
+            fig, (ax_matrix, ax_pdf) = plt.subplots(
+                2,
+                1,
+                figsize=(7.5, 8),
+                gridspec_kw={"height_ratios": [1.15, 1]},
+            )
+
+            im = ax_matrix.imshow(pmf, origin="lower", vmin=0, vmax=1, cmap="Blues")
+            fig.colorbar(im, ax=ax_matrix, label="P(predicted N | truth N)")
+            ax_matrix.set_xticks(predicted_counts)
+            ax_matrix.set_yticks(predicted_counts)
+            ax_matrix.set_xlabel("Predicted N (argmax)")
+            ax_matrix.set_ylabel("Truth N")
+            ax_matrix.set_title(f"Detection Count Confusion: {cluster_name}")
+
+            for truth_count in range(max_count + 1):
+                for predicted_count in range(max_count + 1):
+                    probability = pmf[truth_count, predicted_count]
+                    if probability <= 0:
+                        continue
+                    text_color = "white" if probability > 0.5 else "black"
+                    ax_matrix.text(
+                        predicted_count,
+                        truth_count,
+                        f"{probability:.2f}",
+                        ha="center",
+                        va="center",
+                        fontsize=8,
+                        color=text_color,
+                    )
+
+            for truth_count in range(max_count + 1):
+                total = row_sum[truth_count, 0]
+                if total <= 0:
+                    continue
+                expected_count = (soft_pmf[truth_count] * predicted_counts).sum()
+                ax_pdf.step(
+                    predicted_counts,
+                    soft_pmf[truth_count],
+                    where="mid",
+                    linewidth=2,
+                    marker="o",
+                    label=f"Truth {truth_count}{cluster_name}: soft E[N]={expected_count:.2f}",
+                )
+
+            ax_pdf.set_xticks(predicted_counts)
+            ax_pdf.set_ylim(0, 1)
+            ax_pdf.set_xlabel("N")
+            ax_pdf.set_ylabel("Mean predicted P(N)")
+            ax_pdf.set_title("Soft Count Probability by Truth")
+            ax_pdf.grid(True, linestyle=":", linewidth=0.5, alpha=0.5)
+            ax_pdf.legend(loc="best", fontsize=8)
+            fig.tight_layout()
+            return_plot[cluster_name] = fig
+        return return_plot
+
+    def detection_count_summary_log(self):
+        return_log = dict()
+        for cluster_name, confusion in self.detection_count_confusion.items():
+            row_sum = confusion.sum(axis=1)
+            max_count = confusion.shape[0] - 1
+            predicted_counts = np.arange(max_count + 1)
+            probability_sum = self.detection_count_probability_sum[cluster_name]
+            for truth_count in range(max_count + 1):
+                denominator = row_sum[truth_count]
+                if denominator <= 0:
+                    continue
+
+                predicted_mean = (probability_sum[truth_count] * predicted_counts).sum() / denominator
+                return_log[
+                    f"detection/{self.process}/{cluster_name}/truth_{truth_count}/expected_predicted_n"
+                ] = predicted_mean
+        return return_log
+
+    def plot_detection_survival_summary(self):
+        return_plot = dict()
+        for cluster_name, names, orbit in self.clusters:
+            max_count = len(names)
+            means = np.zeros((max_count, max_count))
+            for truth_count in range(1, max_count + 1):
+                hist_by_order = self.detection_survival_metrics[cluster_name][truth_count]
+                for detection_order, hist in enumerate(hist_by_order, start=1):
+                    total = hist.sum()
+                    if total <= 0:
+                        continue
+                    means[truth_count - 1, detection_order - 1] = (
+                        hist * self.bin_centers_score
+                    ).sum() / total
+
+            fig, ax = plt.subplots(figsize=(1.6 * max_count + 3.2, 1.2 * max_count + 2.6))
+            im = ax.imshow(means, origin="lower", vmin=0, vmax=1, cmap="viridis")
+            fig.colorbar(im, ax=ax, label="Mean survival probability")
+
+            ax.set_xticks(np.arange(max_count))
+            ax.set_yticks(np.arange(max_count))
+            ax.set_xticklabels([f"P(N>={i})" for i in range(1, max_count + 1)])
+            ax.set_yticklabels([f"Truth {i}{cluster_name}" for i in range(1, max_count + 1)])
+            ax.set_xlabel("Detection survival output")
+            ax.set_ylabel("Truth count")
+            ax.set_title(f"Detection Survival Summary: {cluster_name}")
+
+            for truth_index in range(max_count):
+                for detection_index in range(max_count):
+                    mean_value = means[truth_index, detection_index]
+                    text_color = "white" if mean_value < 0.35 else "black"
+                    ax.text(
+                        detection_index,
+                        truth_index,
+                        f"{mean_value:.2f}",
+                        ha="center",
+                        va="center",
+                        fontsize=8,
+                        color=text_color,
+                    )
+
+            fig.tight_layout()
+            return_plot[cluster_name] = fig
+        return return_plot
+
     def summary_log(self):
         return_log = dict()
 
@@ -954,6 +1195,7 @@ def shared_epoch_end(
 
             logs = metrics_valid[process].summary_log()
             logger.log(logs)
+            logger.log(metrics_valid[process].detection_count_summary_log())
 
             # if metrics_train[process] is not None:
             #     training_logs = metrics_train[process].summary_log()
@@ -981,17 +1223,25 @@ def shared_epoch_end(
             for _, fig in figs.items():
                 plt.close(fig)
 
-            figs = metrics_valid[process].plot_score(target="detection_score")
+            figs = metrics_valid[process].plot_score(target="assignment_score")
             wandb.log({
-                f"assignment_reco_detection/{process}/{name}": wandb.Image(fig)
+                f"assignment_score/{process}/{name}": wandb.Image(fig)
                 for name, fig in figs.items()
             })
             for _, fig in figs.items():
                 plt.close(fig)
 
-            figs = metrics_valid[process].plot_score(target="assignment_score")
+            figs = metrics_valid[process].plot_detection_count_distribution()
             wandb.log({
-                f"assignment_score/{process}/{name}": wandb.Image(fig)
+                f"detection/{process}/{name}/count_distribution": wandb.Image(fig)
+                for name, fig in figs.items()
+            })
+            for _, fig in figs.items():
+                plt.close(fig)
+
+            figs = metrics_valid[process].plot_detection_survival_summary()
+            wandb.log({
+                f"detection/{process}/{name}/survival_mean": wandb.Image(fig)
                 for name, fig in figs.items()
             })
             for _, fig in figs.items():
