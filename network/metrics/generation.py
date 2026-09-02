@@ -58,9 +58,11 @@ class GenerationMetrics:
 
         self.histogram = dict()
         self.truth_histogram = dict()
+        self.reference_histogram = dict()
 
         self.histogram_2d = dict()
         self.pearson_stats = dict()
+        self.reference_pearson_stats = dict()
 
         self.special_bins = dict()
         self.special_bins_centers = dict()
@@ -80,12 +82,14 @@ class GenerationMetrics:
             eta=1.0,
             schedules: Union[None, dict] = None,
             precomputed_neutrino: torch.Tensor = None,
+            reference_neutrino: torch.Tensor = None,
             neutrino_only: bool = False,
     ):
         model.eval()
 
         predict_distribution = dict()
         truth_distribution = dict()
+        reference_distribution = dict()
         process_id = input_set['classification'] if 'classification' in input_set else torch.zeros_like(
             input_set['conditions_mask']).long()  # (batch_size, 1)
         masking = dict()
@@ -205,11 +209,17 @@ class GenerationMetrics:
                 raise ValueError(
                     "Precomputed neutrino validation output does not match truth shape"
                 )
+            if reference_neutrino is not None and reference_neutrino.shape != generated_distribution.shape:
+                raise ValueError(
+                    "Reference neutrino validation output does not match prediction shape"
+                )
 
             for i in range(data_shape[-1]):
                 masking[f"neutrino-{self.invisible_feature_names[i]}"] = input_set["x_invisible_mask"]
                 predict_distribution[f"neutrino-{self.invisible_feature_names[i]}"] = generated_distribution[..., i]
                 truth_distribution[f"neutrino-{self.invisible_feature_names[i]}"] = input_set['x_invisible'][..., i]
+                if reference_neutrino is not None:
+                    reference_distribution[f"neutrino-{self.invisible_feature_names[i]}"] = reference_neutrino[..., i]
 
         # --------------- working line -----------------
         for distribution_name, distribution in predict_distribution.items():
@@ -228,6 +238,11 @@ class GenerationMetrics:
                     class_name: np.zeros(num_bins)
                     for class_name in self.class_names
                 }
+            if distribution_name in reference_distribution and distribution_name not in self.reference_histogram:
+                self.reference_histogram[distribution_name] = {
+                    class_name: np.zeros(num_bins)
+                    for class_name in self.class_names
+                }
 
             if distribution_name not in self.histogram_2d:
                 self.histogram_2d[distribution_name] = {
@@ -237,6 +252,14 @@ class GenerationMetrics:
 
             if distribution_name not in self.pearson_stats:
                 self.pearson_stats[distribution_name] = {
+                    class_name: {
+                        'sum_x': 0.0, 'sum_y': 0.0,
+                        'sum_xx': 0.0, 'sum_yy': 0.0,
+                        'sum_xy': 0.0, 'n': 0
+                    } for class_name in self.class_names
+                }
+            if distribution_name in reference_distribution and distribution_name not in self.reference_pearson_stats:
+                self.reference_pearson_stats[distribution_name] = {
                     class_name: {
                         'sum_x': 0.0, 'sum_y': 0.0,
                         'sum_xx': 0.0, 'sum_yy': 0.0,
@@ -268,6 +291,16 @@ class GenerationMetrics:
                 hist, _ = np.histogram(truth, bins=hist_bins)
                 self.truth_histogram[distribution_name][class_name] += hist
 
+                reference = None
+                if distribution_name in reference_distribution:
+                    if distribution_name in masking and (
+                            reference_distribution[distribution_name].size() == masking[distribution_name].size()):
+                        reference = reference_distribution[distribution_name][class_mask].flatten()[total_mask].detach().cpu().numpy()
+                    else:
+                        reference = reference_distribution[distribution_name][class_mask].flatten().detach().cpu().numpy()
+                    hist, _ = np.histogram(reference, bins=hist_bins)
+                    self.reference_histogram[distribution_name][class_name] += hist
+
                 hist2d, _, _ = np.histogram2d(pred, truth, bins=[hist_bins, hist_bins])
                 self.histogram_2d[distribution_name][class_name] += hist2d
 
@@ -279,13 +312,23 @@ class GenerationMetrics:
                 stats['sum_yy'] += (truth ** 2).sum()
                 stats['sum_xy'] += (pred * truth).sum()
                 stats['n'] += pred.shape[0]
+                if reference is not None:
+                    stats = self.reference_pearson_stats[distribution_name][class_name]
+                    stats['sum_x'] += reference.sum()
+                    stats['sum_y'] += truth.sum()
+                    stats['sum_xx'] += (reference ** 2).sum()
+                    stats['sum_yy'] += (truth ** 2).sum()
+                    stats['sum_xy'] += (reference * truth).sum()
+                    stats['n'] += reference.shape[0]
 
     def reset(self):
         self.histogram = dict()
         self.truth_histogram = dict()
+        self.reference_histogram = dict()
 
         self.histogram_2d = dict()
         self.pearson_stats = dict()
+        self.reference_pearson_stats = dict()
 
     def reduce_across_gpus(self):
         if not torch.distributed.is_initialized():
@@ -301,9 +344,16 @@ class GenerationMetrics:
 
         reduce_nested_histogram(self.histogram, dtype=torch.long)
         reduce_nested_histogram(self.truth_histogram, dtype=torch.long)
+        reduce_nested_histogram(self.reference_histogram, dtype=torch.long)
         reduce_nested_histogram(self.histogram_2d, dtype=torch.long)
 
         for name, stats_group in self.pearson_stats.items():
+            for class_name, stats in stats_group.items():
+                for key in ['sum_x', 'sum_y', 'sum_xx', 'sum_yy', 'sum_xy', 'n']:
+                    tensor = torch.tensor(stats[key], dtype=torch.float32, device=self.device)
+                    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+                    stats[key] = tensor.item()
+        for name, stats_group in self.reference_pearson_stats.items():
             for class_name, stats in stats_group.items():
                 for key in ['sum_x', 'sum_y', 'sum_xx', 'sum_yy', 'sum_xy', 'n']:
                     tensor = torch.tensor(stats[key], dtype=torch.float32, device=self.device)
@@ -316,6 +366,7 @@ class GenerationMetrics:
             histogram,
             bin_widths,
             bin_centers,
+            reference_histogram=None,
     ):
 
         colors = [
@@ -332,7 +383,7 @@ class GenerationMetrics:
             if np.sum(counts) > 0:
                 density = counts / (np.sum(counts) * bin_widths)
                 color = colors[cls % len(colors)]
-                label = f"{cls_name} (Pred)"
+                label = f"{cls_name} (RL policy)" if reference_histogram is not None else f"{cls_name} (Pred)"
                 plt.plot(
                     bin_centers,
                     density,
@@ -356,6 +407,15 @@ class GenerationMetrics:
                     alpha=0.7,
                     label=f"{cls_name} (Truth)", edgecolor=color, fill=False
                 )
+
+            if reference_histogram is not None:
+                reference_counts = reference_histogram[cls_name]
+                if np.sum(reference_counts) > 0:
+                    reference_density = reference_counts / (np.sum(reference_counts) * bin_widths)
+                    plt.plot(
+                        bin_centers, reference_density, color=color,
+                        label=f"{cls_name} (Frozen)", linewidth=2,
+                    )
 
             if (np.sum(counts) > 0) and (np.sum(truth_counts) > 0):
                 p = truth_counts / np.sum(truth_counts)
@@ -396,9 +456,18 @@ class GenerationMetrics:
                 self.histogram[name],
                 bin_widths=bin_widths,
                 bin_centers=bin_centers,
+                reference_histogram=self.reference_histogram.get(name),
             )
             for cls_name, score in jsd.items():
                 jsd_results[f"{name}-{cls_name}"] = score
+                if name in self.reference_histogram:
+                    reference_counts = self.reference_histogram[name][cls_name]
+                    truth_counts = self.truth_histogram[name][cls_name]
+                    if np.sum(reference_counts) > 0 and np.sum(truth_counts) > 0:
+                        jsd_results[f"reference-{name}-{cls_name}"] = jensenshannon(
+                            truth_counts / np.sum(truth_counts),
+                            reference_counts / np.sum(reference_counts),
+                        )
 
             for class_name in self.class_names:
                 if class_name not in jsd:
@@ -423,7 +492,7 @@ class GenerationMetrics:
             pearson_results[name] = dict()
             for class_name in self.class_names:
 
-                if class_name not in jsd_results:
+                if f"{name}-{class_name}" not in jsd_results:
                     continue
 
                 stats = self.pearson_stats[name][class_name]
@@ -438,6 +507,17 @@ class GenerationMetrics:
                 else:
                     r = numerator / denominator
                 pearson_results[name][class_name] = r
+
+                if name in self.reference_pearson_stats:
+                    stats = self.reference_pearson_stats[name][class_name]
+                    n = stats['n']
+                    numerator = n * stats['sum_xy'] - stats['sum_x'] * stats['sum_y']
+                    denominator = np.sqrt(
+                        (n * stats['sum_xx'] - stats['sum_x'] ** 2) *
+                        (n * stats['sum_yy'] - stats['sum_y'] ** 2)
+                    )
+                    pearson_results[f"reference-{name}"] = pearson_results.get(f"reference-{name}", {})
+                    pearson_results[f"reference-{name}"][class_name] = 0.0 if denominator == 0 else numerator / denominator
 
         return figs, pearson_results, jsd_results
 

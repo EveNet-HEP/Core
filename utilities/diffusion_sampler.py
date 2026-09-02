@@ -27,6 +27,16 @@ def get_logsnr_alpha_sigma(time: Tensor, shape=None):
     return logsnr, alpha, sigma
 
 
+def cosine_phase_rate() -> float:
+    """Return d atan2(sigma, alpha) / dt for the cosine schedule.
+
+    With alpha=cos(phi) and sigma=sin(phi), v-prediction maps to the
+    probability-flow velocity by dx/dt = phi' * v.  The rate is constant for
+    this schedule, so it is a coefficient convention rather than a new loss.
+    """
+    return float(torch.atan(torch.exp(torch.tensor(10.0))) - torch.atan(torch.exp(torch.tensor(-10.0))))
+
+
 def add_noise(x: Tensor, time: Tensor) -> tuple[Tensor, Tensor]:
     """
     x: input tensor,

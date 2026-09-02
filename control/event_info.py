@@ -182,7 +182,7 @@ class EventInfo:
                             key = "/".join([process, particle] + [target.name])
                             self.regression_types[key] = target.type
 
-        self.regression_names = self.regression_types.keys()
+        self.regression_names = list(self.regression_types)
         self.num_regressions = len(self.regression_names)
 
         self.classifications = classifications
