@@ -78,7 +78,9 @@ class GenerationMetrics:
             num_steps_point_cloud=40,
             num_steps_neutrino=40,
             eta=1.0,
-            schedules: Union[None, dict] = None
+            schedules: Union[None, dict] = None,
+            precomputed_neutrino: torch.Tensor = None,
+            neutrino_only: bool = False,
     ):
         model.eval()
 
@@ -94,7 +96,7 @@ class GenerationMetrics:
             do_recon = schedules.get('generation', False)
             do_truth = schedules.get('neutrino_generation', False)
 
-        if self.global_generation:
+        if self.global_generation and not neutrino_only:
             ####################################
             ##  Step 1: Generate num vectors  ##
             ####################################
@@ -135,7 +137,7 @@ class GenerationMetrics:
                     input_set = copy.deepcopy(input_set)
                     input_set['conditions'][..., self.target_global_index] = generated_global
 
-        if self.point_cloud_generation and do_recon:
+        if self.point_cloud_generation and do_recon and not neutrino_only:
             ####################################
             ##  Step 2: Generate point cloud  ##
             ####################################
@@ -179,24 +181,30 @@ class GenerationMetrics:
             process_id = input_set['classification'] if 'classification' in input_set else torch.zeros_like(
                 input_set['conditions_mask'].flatten()).long()  # (batch_size, 1)
 
-            predict_for_neutrino = partial(
-                model.predict_diffusion_vector,
-                mode="neutrino",
-                cond_x=input_set,
-                noise_mask=input_set["x_invisible_mask"].unsqueeze(-1)  # [B, T, 1] to match noise x
-            )
-
-            generated_distribution = self.sampler.sample(
-                data_shape=data_shape,
-                pred_fn=predict_for_neutrino,
-                normalize_fn=model.invisible_normalizer,
-                eta=eta,
-                num_steps=num_steps_neutrino,
-                use_tqdm=False,
-                process_name=f"Neutrino",
-                # remove_padding=(getattr(model, "invisible_padding", 0) > 0),
-                remove_padding=False,
-            )
+            if precomputed_neutrino is not None:
+                generated_distribution = precomputed_neutrino
+            else:
+                predict_for_neutrino = partial(
+                    model.predict_diffusion_vector,
+                    mode="neutrino",
+                    cond_x=input_set,
+                    noise_mask=input_set["x_invisible_mask"].unsqueeze(-1),
+                )
+                generated_distribution = self.sampler.sample(
+                    data_shape=data_shape,
+                    pred_fn=predict_for_neutrino,
+                    normalize_fn=model.invisible_normalizer,
+                    eta=eta,
+                    num_steps=num_steps_neutrino,
+                    use_tqdm=False,
+                    process_name="Neutrino",
+                    # remove_padding=(getattr(model, "invisible_padding", 0) > 0),
+                    remove_padding=False,
+                )
+            if generated_distribution.shape != input_set['x_invisible'].shape:
+                raise ValueError(
+                    "Precomputed neutrino validation output does not match truth shape"
+                )
 
             for i in range(data_shape[-1]):
                 masking[f"neutrino-{self.invisible_feature_names[i]}"] = input_set["x_invisible_mask"]
