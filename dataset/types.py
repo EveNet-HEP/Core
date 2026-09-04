@@ -147,6 +147,7 @@ class SpecialKey(str, Enum):
     ClassLabel = "CLASSLABEL"
     ParticleProperties = "PARTICLE_PROPERTIES"
     Generations = "GENERATIONS"
+    GroupedInputs = "GROUPED_INPUTS"
     Invisible = "Neutrinos"
 
 

@@ -95,6 +95,7 @@ class EventInfo:
             resonance_particle_properties: List,
             generations: Dict[str, Dict],
             invisible_input_features: Tuple[FeatureInfo, ...],
+            grouped_inputs: Dict[str, Dict] | None = None,
             resonance_label=None,
     ):
 
@@ -103,6 +104,7 @@ class EventInfo:
         self.input_types = input_types
         self.input_names = list(input_types.keys())
         self.input_features = input_features
+        self.grouped_inputs = grouped_inputs or {}
 
         self.event_particles = event_particles
         self.event_mapping = OrderedDict()
@@ -258,6 +260,7 @@ class EventInfo:
         # Generation Head setting
         # For point cloud generation
         self.sequential_feature_names = []
+        self.raw_sequential_feature_names = []
         self.sequential_inv_cdf_index = []
         iglobal_index = 0
         seq_index = 0
@@ -287,6 +290,7 @@ class EventInfo:
                 for input_feature_element in input_feature:
                     log_prefix = "log_" if input_feature_element.log_scale else ""
                     name = f"{log_prefix}{input_feature_element.name}"
+                    self.raw_sequential_feature_names.append(input_feature_element.name)
                     self.sequential_feature_names.append(name)
                     if input_feature_element.uniform:
                         self.sequential_inv_cdf_index.append(seq_index)
@@ -305,6 +309,16 @@ class EventInfo:
             self.invisible_feature_names.append(name)
             if input_feature_element.uniform:
                 self.invisible_inv_cdf_index.append(idx)
+
+        grouped_sequential_cfg = self.grouped_inputs.get("SEQUENTIAL", {}).get("Source", {})
+        self.grouped_sequential_config = grouped_sequential_cfg if grouped_sequential_cfg else None
+        if self.grouped_sequential_config is not None:
+            self.projected_sequential_feature_names = list(
+                self.grouped_sequential_config.get("projected_feature_names", self.sequential_feature_names)
+            )
+        else:
+            self.projected_sequential_feature_names = list(self.sequential_feature_names)
+        self.projected_sequential_input_dim = len(self.projected_sequential_feature_names)
 
         search_name = ["pt", "eta", "phi", "energy"]
         self.ptetaphienergy_index = []
@@ -570,6 +584,7 @@ class EventInfo:
         resonance_label = key_with_default(config, "RESONANCE_LABEL", default=[])
 
         generations = key_with_default(config, SpecialKey.Generations, default={})
+        grouped_inputs = key_with_default(config, SpecialKey.GroupedInputs, default={})
 
         resonance_particle_property = key_with_default(config, SpecialKey.ParticleProperties, default=[])
 
@@ -601,5 +616,6 @@ class EventInfo:
             resonance_particle_property,
             generations,
             invisible_input_features,
+            grouped_inputs,
             resonance_label
         )
