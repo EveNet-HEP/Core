@@ -63,7 +63,7 @@ class EveNetModel(nn.Module):
             input_normalizers_setting_local = {
                 "norm_mask": torch.tensor(
                     [feature_info.normalize for feature_info in self.event_info.input_features[input_name]],
-                    dtype=torch.bool, device=self.device
+                    device=self.device
                 ),
                 "mean": normalization_dict["input_mean"][input_name].to(self.device),
                 "std": normalization_dict["input_std"][input_name].to(self.device)
