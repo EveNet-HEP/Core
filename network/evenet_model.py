@@ -8,6 +8,7 @@ from evenet.network.layers.invisible_input_projector import InvisibleInputProjec
 from evenet.network.body.normalizer import Normalizer
 from evenet.network.body.embedding import GlobalVectorEmbedding, PETBody
 from evenet.network.body.grouped_sequential_embedding import GroupedSequentialEmbedding
+from evenet.network.body.visible_conditioning import visible_conditioning_spec
 from evenet.network.body.object_encoder import ObjectEncoder
 from evenet.network.heads.classification.classification_head import ClassificationHead, RegressionHead
 from evenet.network.heads.assignment.assignment_head import SharedAssignmentHead
@@ -310,7 +311,16 @@ class EveNetModel(nn.Module):
                 drop_probability=self.network_cfg.TruthGeneration.drop_probability,
                 feature_drop=self.network_cfg.TruthGeneration.feature_drop,
                 position_encode=self.network_cfg.TruthGeneration.neutrino_position_encode,
-                max_position_length=self.network_cfg.TruthGeneration.max_position_length
+                max_position_length=self.network_cfg.TruthGeneration.max_position_length,
+                # Optional event-level FiLM, configured by network.VisibleConditioning (default: disabled).
+                visible_conditioning=visible_conditioning_spec(
+                    self.network_cfg,
+                    feature_names=self._raw_sequential_feature_names(),
+                    token_dim=self.sequential_input_dim,
+                    hidden_dim=self.network_cfg.TruthGeneration.hidden_dim,
+                    num_layers=self.network_cfg.TruthGeneration.num_layers,
+                    global_cond_dim=self.global_input_dim,
+                ),
             )
             self.neutrino_position_encode = self.network_cfg.TruthGeneration.neutrino_position_encode
 
@@ -447,12 +457,12 @@ class EveNetModel(nn.Module):
         ## Input normalization ##
         #########################
 
-        input_point_cloud = self.sequential_normalizer(
+        normalized_point_cloud = self.sequential_normalizer(
             x=input_point_cloud,
             mask=input_point_cloud_mask,
         )
         input_point_cloud = self.project_sequential_inputs(
-            x=input_point_cloud,
+            x=normalized_point_cloud,
             mask=input_point_cloud_mask,
         )
 
@@ -681,7 +691,12 @@ class EveNetModel(nn.Module):
                     label=class_label,
                     attn_mask=full_attn_mask,
                     time_masking=time_masking,
-                    position_encode=(self.neutrino_position_encode and schedule_name == "neutrino_generation")
+                    position_encode=(self.neutrino_position_encode and schedule_name == "neutrino_generation"),
+                    visible_raw=x['x'],
+                    visible_tokens=input_point_cloud,
+                    visible_mask=input_point_cloud_mask,
+                    visible_normalized=normalized_point_cloud,
+                    global_conditions=global_conditions,
                 )
                 generations["neutrino"] = {
                     "vector": pred_point_cloud_vector[:, is_invisible_query, :],
@@ -789,12 +804,12 @@ class EveNetModel(nn.Module):
             input_point_cloud = cond_x['x']
             input_point_cloud_mask = cond_x['x_mask'].unsqueeze(-1)
 
-            input_point_cloud = self.sequential_normalizer(
+            normalized_point_cloud = self.sequential_normalizer(
                 x=input_point_cloud,
                 mask=input_point_cloud_mask,
             )
             input_point_cloud = self.project_sequential_inputs(
-                x=input_point_cloud,
+                x=normalized_point_cloud,
                 mask=input_point_cloud_mask,
             )
 
@@ -857,7 +872,12 @@ class EveNetModel(nn.Module):
                 label=class_label,
                 attn_mask=full_attn_mask,
                 time_masking=time_masking,
-                position_encode=self.neutrino_position_encode
+                position_encode=self.neutrino_position_encode,
+                visible_raw=cond_x['x'],
+                visible_tokens=input_point_cloud,
+                visible_mask=input_point_cloud_mask,
+                visible_normalized=normalized_point_cloud,
+                global_conditions=global_conditions,
             )
 
             return pred_point_cloud_vector[:, is_invisible_query, :]

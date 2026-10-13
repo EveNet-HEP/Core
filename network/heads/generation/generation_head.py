@@ -11,6 +11,7 @@ from evenet.network.layers.linear_block import ResNetDense
 from evenet.network.layers.utils import StochasticDepth
 from evenet.network.layers.transformer import GeneratorTransformerBlockModule
 from evenet.network.layers.activation import create_residual_connection
+from evenet.network.body.visible_conditioning import VisibleConditioning
 
 
 class EventGenerationHead(nn.Module):
@@ -29,7 +30,8 @@ class EventGenerationHead(nn.Module):
             drop_probability: float,
             feature_drop: float,
             position_encode: bool = False,
-            max_position_length: int = 20
+            max_position_length: int = 20,
+            visible_conditioning: Optional[dict] = None,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -79,6 +81,8 @@ class EventGenerationHead(nn.Module):
             for _ in range(num_layers)
         ])
         self.generator = nn.Linear(projection_dim, output_dim)
+        # Optional event-level FiLM (see visible_conditioning.py); zero-initialised, so identity at start.
+        self.visible_conditioning = VisibleConditioning(**visible_conditioning) if visible_conditioning else None
 
     def forward(self,
                 x,
@@ -90,7 +94,12 @@ class EventGenerationHead(nn.Module):
                 label,
                 attn_mask=None,
                 time_masking=None,
-                position_encode=False):
+                position_encode=False,
+                visible_raw=None,
+                visible_tokens=None,
+                visible_mask=None,
+                visible_normalized=None,
+                global_conditions=None):
         """
         x: [B, T, D] <- Noised Input
         global_cond: [B, 1, D] <- Global Condition
@@ -100,6 +109,8 @@ class EventGenerationHead(nn.Module):
         time: [B,] <- Time
         label: [B, 1] <- Conditional Label, one-hot in function,
         time_masking: [B, T, 1] <- Mask for time embedding
+        visible_raw / visible_tokens / visible_mask / visible_normalized / global_conditions:
+            inputs of the optional FiLM conditioning (only used when visible_conditioning is enabled)
         """
         time_emb = self.time_embedding(time).unsqueeze(1).expand(-1, x.shape[1], -1)  # [B, 1, proj_dim]
         if time_masking is not None:
@@ -133,9 +144,26 @@ class EventGenerationHead(nn.Module):
         else:
             print("ERROR: In Generation Head, Label is None, skipping label embedding")
 
-        for transformer_block in self.gen_transformer_blocks:
+        modulations, modulation_mask = None, None
+        if self.visible_conditioning is not None:
+            if any(v is None for v in (visible_raw, visible_tokens, visible_mask, time_masking)):
+                raise ValueError("FiLM conditioning requires visible inputs and the invisible time mask")
+            modulations = self.visible_conditioning(
+                visible_raw, visible_tokens, visible_mask,
+                normalized_raw=visible_normalized,
+                global_conditions=global_conditions,
+                global_conditions_mask=global_cond_mask,
+            )
+            # Only valid invisible (noised) slots are modulated; visible tokens are untouched.
+            modulation_mask = time_masking.bool() & x_mask.bool()
+
+        for index, transformer_block in enumerate(self.gen_transformer_blocks):
             concatenated = cond_token + x
-            out_x, cond_token = transformer_block(concatenated, cond_token, x_mask, attn_mask=attn_mask)
+            out_x, cond_token = transformer_block(
+                concatenated, cond_token, x_mask, attn_mask=attn_mask,
+                modulation=modulations[index] if modulations is not None else None,
+                modulation_mask=modulation_mask,
+            )
         x = cond_token + x
         x = F.layer_norm(x, [x.size(-1)])
         x = self.generator(x)
