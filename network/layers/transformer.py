@@ -7,7 +7,7 @@ from evenet.network.layers.linear_block import GRUGate, GRUBlock
 from evenet.network.layers.activation import create_residual_connection
 
 from typing import Optional
-from evenet.network.body.visible_conditioning import modulate_visible_condition
+from evenet.network.layers.film import apply_film
 
 class TransformerBlockModule(nn.Module):
     def __init__(self, projection_dim, num_heads, dropout, talking_head, layer_scale, layer_scale_init,
@@ -309,12 +309,13 @@ class GeneratorTransformerBlockModule(nn.Module):
         :param x: point_cloud (batch_size, num_objects, projection_dim)
         :param cond_token: (batch_size, 1, projection_dim)
         :param mask: (batch_size, num_objects, 1)
-        :param modulation: optional FiLM (attn_gamma, attn_beta, ffn_gamma, ffn_beta), each (batch_size, projection_dim)
+        :param modulation: optional FiLM {"attention" / "ffn": (gamma or None, beta)}, each (batch_size, projection_dim)
         :param modulation_mask: (batch_size, num_objects, 1), slots that receive the FiLM update
         """
+        modulation = modulation or {}
         x1 = self.norm1(x)
-        if modulation is not None:
-            x1 = modulate_visible_condition(x1, modulation[0], modulation[1], modulation_mask)
+        if "attention" in modulation:
+            x1 = apply_film(x1, modulation["attention"], modulation_mask)
         padding_mask = ~(mask.squeeze(2).bool()) if mask is not None else None
 
         if (attn_mask is not None) and (attn_mask.dim() == 3):
@@ -329,8 +330,8 @@ class GeneratorTransformerBlockModule(nn.Module):
             updates = self.layer_scale1(updates, mask)
         x2 = updates + cond_token
         x3 = self.norm3(x2)
-        if modulation is not None:
-            x3 = modulate_visible_condition(x3, modulation[2], modulation[3], modulation_mask)
+        if "ffn" in modulation:
+            x3 = apply_film(x3, modulation["ffn"], modulation_mask)
         x3 = self.mlp(x3)
 
         if self.layer_scale_flag:
