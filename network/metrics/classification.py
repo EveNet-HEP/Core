@@ -174,7 +174,7 @@ class ClassificationMetrics:
         # Use training store if provided, else default to self.hist_store
         train_hist_store = self.train_hist_store if self.train_hist_store is not None else self.hist_store
 
-        # Custom color palette (max 10 classes)
+        # Custom color palette, reused cyclically beyond 10 classes
         colors = [
             "#40B0A6", "#6D8EF7", "#6E579A", "#A38E89", "#A5C8DD",
             "#CD5582", "#E1BE6A", "#E1BE6A", "#E89A7A", "#EC6B2D"
@@ -268,8 +268,8 @@ class ClassificationMetrics:
             auc_valid = auc(fpr_valid, tpr_valid)
             auc_scores_valid[target_cls] = auc_valid
 
-            plt.plot(fpr, tpr, color=colors[target_cls], lw=2, label=f"AUC = {roc_auc:.3f}")
-            plt.plot(fpr_valid, tpr_valid, '--', color=colors[target_cls], lw=2, label=f"AUC[valid] = {auc_valid:.3f}")
+            plt.plot(fpr, tpr, color=colors[target_cls % len(colors)], lw=2, label=f"AUC = {roc_auc:.3f}")
+            plt.plot(fpr_valid, tpr_valid, '--', color=colors[target_cls % len(colors)], lw=2, label=f"AUC[valid] = {auc_valid:.3f}")
             plt.plot([0, 1], [0, 1], 'k--', lw=1)
             plt.xlim([0.0, 1.0])
             plt.ylim([0.0, 1.05])
