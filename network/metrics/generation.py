@@ -17,6 +17,28 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Figure style of the validation plots (matches the Ztautau evaluation figures): small sans-serif fonts,
+# open axes, no legend frame. Applied per figure with plt.rc_context, so nothing else is affected.
+PLOT_STYLE = {"font.family": "sans-serif",
+              "font.sans-serif": ["Arial", "Liberation Sans", "Helvetica", "Nimbus Sans", "DejaVu Sans"],
+              "font.size": 7, "axes.labelsize": 7, "axes.titlesize": 8, "axes.linewidth": 0.8,
+              "axes.spines.top": False, "axes.spines.right": False, "legend.frameon": False,
+              "xtick.labelsize": 6, "ytick.labelsize": 6, "xtick.major.width": 0.6, "ytick.major.width": 0.6,
+              "xtick.direction": "in", "ytick.direction": "in", "figure.dpi": 150}
+# Okabe-Ito first, then tab10: distinguishable for up to ~18 classes
+CLASS_COLORS = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9", "#F0E442", "#000000",
+                "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+                "#bcbd22", "#17becf"]
+
+
+def _pretty(name: str) -> str:
+    """Display name of a distribution key: 'neutrino-delta_theta' -> 'neutrino: delta_theta'."""
+    for prefix in ("neutrino-", "point cloud-", "global-"):
+        if name.startswith(prefix):
+            return f"{prefix[:-1]}: {name[len(prefix):]}"
+    return name
+
+
 class GenerationMetrics:
     def __init__(
             self, device, class_names,
@@ -61,6 +83,7 @@ class GenerationMetrics:
         self.reference_histogram = dict()
 
         self.histogram_2d = dict()
+        self.residual_histogram = dict()   # prediction - truth per event, same bin width as the marginals
         self.pearson_stats = dict()
         self.reference_pearson_stats = dict()
 
@@ -249,6 +272,11 @@ class GenerationMetrics:
                     class_name: np.zeros((num_bins, num_bins))
                     for class_name in self.class_names
                 }
+            if distribution_name not in self.residual_histogram:
+                self.residual_histogram[distribution_name] = {
+                    class_name: np.zeros(num_bins)
+                    for class_name in self.class_names
+                }
 
             if distribution_name not in self.pearson_stats:
                 self.pearson_stats[distribution_name] = {
@@ -303,6 +331,9 @@ class GenerationMetrics:
 
                 hist2d, _, _ = np.histogram2d(pred, truth, bins=[hist_bins, hist_bins])
                 self.histogram_2d[distribution_name][class_name] += hist2d
+                if pred.shape == truth.shape:  # residual bins: the marginal bins re-centred on zero
+                    hist, _ = np.histogram(pred - truth, bins=hist_bins - 0.5 * (hist_bins[0] + hist_bins[-1]))
+                    self.residual_histogram[distribution_name][class_name] += hist
 
                 # Pearson stats
                 stats = self.pearson_stats[distribution_name][class_name]
@@ -327,6 +358,7 @@ class GenerationMetrics:
         self.reference_histogram = dict()
 
         self.histogram_2d = dict()
+        self.residual_histogram = dict()
         self.pearson_stats = dict()
         self.reference_pearson_stats = dict()
 
@@ -346,6 +378,7 @@ class GenerationMetrics:
         reduce_nested_histogram(self.truth_histogram, dtype=torch.long)
         reduce_nested_histogram(self.reference_histogram, dtype=torch.long)
         reduce_nested_histogram(self.histogram_2d, dtype=torch.long)
+        reduce_nested_histogram(self.residual_histogram, dtype=torch.long)
 
         for name, stats_group in self.pearson_stats.items():
             for class_name, stats in stats_group.items():
@@ -360,6 +393,35 @@ class GenerationMetrics:
                     torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
                     stats[key] = tensor.item()
 
+    @staticmethod
+    def _class_grid(active, ratio=False):
+        """Figure with one panel per active class (4 columns); with ratio=True each panel has a ratio axis below."""
+        import matplotlib.gridspec as gridspec
+        n = max(len(active), 1)
+        ncols = min(4, n)
+        nrows = (n + ncols - 1) // ncols
+        fig = plt.figure(figsize=(2.4 * ncols, (2.3 if ratio else 1.9) * nrows + 0.4))
+        outer = gridspec.GridSpec(nrows, ncols, figure=fig, hspace=0.55 if ratio else 0.5, wspace=0.3,
+                                  left=0.07, right=0.99, top=0.9, bottom=0.11)
+        axes = []
+        for k in range(n):
+            cell = outer[k // ncols, k % ncols]
+            if ratio:
+                inner = gridspec.GridSpecFromSubplotSpec(2, 1, subplot_spec=cell, height_ratios=[3, 1], hspace=0.06)
+                ax = fig.add_subplot(inner[0])
+                rax = fig.add_subplot(inner[1], sharex=ax)
+                axes.append((ax, rax))
+            else:
+                axes.append((fig.add_subplot(cell), None))
+        return fig, axes
+
+    @staticmethod
+    def _ratio_limits(r, re):
+        dev = np.abs(r[np.isfinite(r) & np.isfinite(re) & (re < 0.5)] - 1)
+        need = 1.1 * np.quantile(dev, 0.9) if len(dev) else 0.5
+        span = next((x for x in (0.1, 0.2, 0.3, 0.5, 0.75, 1.0) if x >= need), 1.0)
+        return max(0.0, 1 - span), 1 + span
+
     def plot_histogram_func(
             self,
             truth_histogram,
@@ -367,76 +429,119 @@ class GenerationMetrics:
             bin_widths,
             bin_centers,
             reference_histogram=None,
+            name="",
     ):
-
-        colors = [
-            "#40B0A6", "#6D8EF7", "#6E579A", "#A38E89", "#A5C8DD",
-            "#CD5582", "#E1BE6A", "#E1BE6A", "#E89A7A", "#EC6B2D"
-        ]
-
-        fig, ax = plt.subplots()
-
+        """One panel per class: the truth as filled reference with its statistical band, the prediction as
+        points with errors, both normalised to unit area, and a prediction / truth ratio below."""
+        edges = np.concatenate([bin_centers - bin_widths / 2, [bin_centers[-1] + bin_widths[-1] / 2]])
         jsd = dict()
-        for cls, cls_name in enumerate(self.class_names):
-            # Plot training histogram (bars)
-            counts = histogram[cls_name]
-            if np.sum(counts) > 0:
-                density = counts / (np.sum(counts) * bin_widths)
-                color = colors[cls % len(colors)]
-                label = f"{cls_name} (RL policy)" if reference_histogram is not None else f"{cls_name} (Pred)"
-                plt.plot(
-                    bin_centers,
-                    density,
-                    color=color,
-                    label=label,
-                    linestyle='--',
-                    marker='o',
-                    linewidth=2,
-                    markersize=6
-                )
-            truth_counts = truth_histogram[cls_name]
-            if np.sum(truth_counts) > 0:
-                truth_density = truth_counts / (np.sum(truth_counts) * bin_widths)
-                color = colors[cls % len(colors)]
-                label = f"{cls_name} (Truth)"
-                plt.bar(
-                    bin_centers,
-                    truth_density,
-                    width=bin_widths,
-                    color=color,
-                    alpha=0.7,
-                    label=f"{cls_name} (Truth)", edgecolor=color, fill=False
-                )
-
-            if reference_histogram is not None:
-                reference_counts = reference_histogram[cls_name]
-                if np.sum(reference_counts) > 0:
-                    reference_density = reference_counts / (np.sum(reference_counts) * bin_widths)
-                    plt.plot(
-                        bin_centers, reference_density, color=color,
-                        label=f"{cls_name} (Frozen)", linewidth=2,
-                    )
-
-            if (np.sum(counts) > 0) and (np.sum(truth_counts) > 0):
-                p = truth_counts / np.sum(truth_counts)
-                q = counts / np.sum(counts)
-                jsd[cls_name] = (jensenshannon(p, q))
-
-        ax.set_xlabel('Value')
-        ax.set_ylabel('Frequency')
-        ax.legend()
-        # plt.show()
-
+        active = [c for c in self.class_names if np.sum(histogram[c]) > 0 or np.sum(truth_histogram[c]) > 0]
+        with plt.rc_context(PLOT_STYLE):
+            fig, axes = self._class_grid(active, ratio=True)
+            for (ax, rax), cls_name in zip(axes, active):
+                counts, truth_counts = histogram[cls_name].astype(float), truth_histogram[cls_name].astype(float)
+                n_pred, n_truth = np.sum(counts), np.sum(truth_counts)
+                truth_density = truth_counts / (n_truth * bin_widths) if n_truth > 0 else np.zeros_like(counts)
+                truth_err = np.sqrt(truth_counts) / (n_truth * bin_widths) if n_truth > 0 else np.zeros_like(counts)
+                pred_density = counts / (n_pred * bin_widths) if n_pred > 0 else np.zeros_like(counts)
+                pred_err = np.sqrt(counts) / (n_pred * bin_widths) if n_pred > 0 else np.zeros_like(counts)
+                if n_truth > 0:
+                    ax.stairs(truth_density, edges, fill=True, color="#D9D9D9", lw=0, label="Truth")
+                    ax.stairs(truth_density, edges, color="black", lw=0.6)
+                    ax.stairs(truth_density + truth_err, edges, baseline=truth_density - truth_err, fill=True,
+                              facecolor="none", edgecolor="#444444", hatch="//////", lw=0, label="Truth stat.")
+                if n_pred > 0:
+                    shown = counts > 0
+                    ax.errorbar(bin_centers[shown], pred_density[shown], yerr=pred_err[shown], fmt="o", ms=2.0,
+                                color="#0072B2", lw=0.7, capsize=0, label="Prediction")
+                if reference_histogram is not None and np.sum(reference_histogram[cls_name]) > 0:
+                    ref = reference_histogram[cls_name].astype(float)
+                    ax.stairs(ref / (np.sum(ref) * bin_widths), edges, color="#D55E00", lw=0.9, ls="--", label="Reference")
+                text = f"n = {int(n_pred):,}"
+                if n_pred > 0 and n_truth > 0:
+                    jsd[cls_name] = jensenshannon(truth_counts / n_truth, counts / n_pred)
+                    text += f"\nJSD = {jsd[cls_name]:.3f}"
+                top = max(truth_density.max() if n_truth > 0 else 0, (pred_density + pred_err).max() if n_pred > 0 else 0, 1e-9)
+                ax.set_ylim(0, 1.45 * top)
+                ax.set_xlim(edges[0], edges[-1])
+                ax.set_title(cls_name, loc="left", fontsize=7, pad=3)
+                ax.text(0.97, 0.95, text, transform=ax.transAxes, ha="right", va="top", fontsize=5.5, linespacing=1.3)
+                ax.set_ylabel("Density")
+                ax.tick_params(labelbottom=False)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    r = np.where((truth_density > 0) & (counts > 0), pred_density / truth_density, np.nan)
+                    re = pred_err / truth_density
+                    band = np.where(truth_density > 0, truth_err / truth_density, 0.0)
+                lo, hi = self._ratio_limits(r, re)
+                rax.stairs(1 + band, edges, baseline=1 - band, fill=True, color="#D0D0D0", lw=0)
+                rax.axhline(1, color="black", lw=0.5, ls="--")
+                inside = np.isfinite(r) & (r >= lo) & (r <= hi)
+                rax.errorbar(bin_centers[inside], r[inside], yerr=re[inside], fmt="o", ms=1.8, color="#0072B2", lw=0.6, capsize=0)
+                pad = 0.04 * (hi - lo)
+                up, down = np.isfinite(r) & (r > hi), np.isfinite(r) & (r < lo)
+                rax.plot(bin_centers[up], np.full(up.sum(), hi - pad), "^", ms=2.5, color="#0072B2", mec="none")
+                rax.plot(bin_centers[down], np.full(down.sum(), lo + pad), "v", ms=2.5, color="#0072B2", mec="none")
+                rax.set_ylim(lo, hi)
+                rax.set_ylabel("Pred. / Truth", fontsize=6)
+                rax.set_xlabel(_pretty(name))
+            if axes:
+                axes[0][0].legend(fontsize=5.5, loc="upper left", handlelength=1.4, borderaxespad=0.2)
+            fig.suptitle(f"{_pretty(name)} — validation, unit-area marginals per class", x=0.01, ha="left", fontsize=8)
         return fig, jsd
 
+    def plot_residual_func(self, residual_histogram, bin_widths, bin_centers, name=""):
+        """Per-event residual (prediction - truth), one panel per class, with the mean, RMS and 68 % half-width."""
+        centre = 0.5 * (bin_centers[0] - bin_widths[0] / 2 + bin_centers[-1] + bin_widths[-1] / 2)
+        centers = bin_centers - centre
+        edges = np.concatenate([centers - bin_widths / 2, [centers[-1] + bin_widths[-1] / 2]])
+        active = [c for c in self.class_names if np.sum(residual_histogram[c]) > 0]
+        # common x range: 5 x the largest class RMS (the bins span the full target range, residuals are narrower)
+        widest = 0.0
+        for cls_name in active:
+            counts = residual_histogram[cls_name].astype(float)
+            mean = np.sum(counts * centers) / np.sum(counts)
+            widest = max(widest, np.sqrt(np.sum(counts * (centers - mean) ** 2) / np.sum(counts)))
+        half_range = min(edges[-1], max(5 * widest, 3 * bin_widths.max()))
+        with plt.rc_context(PLOT_STYLE):
+            fig, axes = self._class_grid(active)
+            for (ax, _), cls_name in zip(axes, active):
+                counts = residual_histogram[cls_name].astype(float)
+                n = np.sum(counts)
+                mean = np.sum(counts * centers) / n
+                rms = np.sqrt(np.sum(counts * (centers - mean) ** 2) / n)
+                cumulative = np.cumsum(counts) / n
+                q16, q84 = (np.interp(q, cumulative, edges[1:]) for q in (0.16, 0.84))
+                density = counts / (n * bin_widths)
+                ax.stairs(density, edges, fill=True, color="#0072B2", alpha=0.18, lw=0)
+                ax.stairs(density, edges, color="#0072B2", lw=1.0)
+                ax.axvline(0.0, color="black", lw=0.5, ls="--")
+                ax.axvspan(q16, q84, color="#0072B2", alpha=0.08, lw=0)
+                ax.set_title(cls_name, loc="left", fontsize=7, pad=3)
+                ax.text(0.97, 0.95, f"n = {int(n):,}\nmean = {mean:.3g}\nRMS = {rms:.3g}\n68 % = {0.5 * (q84 - q16):.3g}",
+                        transform=ax.transAxes, ha="right", va="top", fontsize=5.5, linespacing=1.3)
+                ax.set_xlim(-half_range, half_range)
+                ax.set_ylim(0, 1.45 * max(density.max(), 1e-9))
+                ax.set_ylabel("Density")
+                ax.set_xlabel("prediction − truth")
+            fig.suptitle(f"{_pretty(name)} — validation residual per event", x=0.01, ha="left", fontsize=8)
+        return fig
+
     def plot_histogram2d_func(self, histogram2d, x_centers, y_centers, title="2D Histogram"):
-        fig, ax = plt.subplots()
-        X, Y = np.meshgrid(x_centers, y_centers, indexing="ij")
-        pcm = ax.pcolormesh(X, Y, histogram2d, shading='auto', cmap='viridis')
-        fig.colorbar(pcm, ax=ax, label="Counts")
-        ax.set_xlabel('Predicted')
-        ax.set_ylabel('Truth')
-        ax.set_title(title)
+        """Prediction against truth (counts, log colour scale) with the diagonal."""
+        import matplotlib.colors as mcolors
+        dx, dy = np.diff(x_centers).mean(), np.diff(y_centers).mean()
+        extent = [y_centers[0] - dy / 2, y_centers[-1] + dy / 2, x_centers[0] - dx / 2, x_centers[-1] + dx / 2]
+        with plt.rc_context(PLOT_STYLE):
+            fig, ax = plt.subplots(figsize=(3.6, 3.2))
+            masked = np.ma.masked_less_equal(histogram2d, 0)
+            image = ax.imshow(masked, origin="lower", extent=extent, aspect="auto", cmap="viridis",
+                              norm=mcolors.LogNorm(vmin=1, vmax=max(float(histogram2d.max()), 1.0)))
+            ax.plot([extent[0], extent[1]], [extent[2], extent[3]], color="#D55E00", lw=0.8, ls="--")
+            fig.colorbar(image, ax=ax, fraction=0.046, pad=0.03, label="Events")
+            ax.set_xlabel("truth")
+            ax.set_ylabel("prediction")
+            ax.set_title(title, loc="left")
+            fig.tight_layout()
         return fig
 
     def plot_histogram(self):
@@ -457,7 +562,11 @@ class GenerationMetrics:
                 bin_widths=bin_widths,
                 bin_centers=bin_centers,
                 reference_histogram=self.reference_histogram.get(name),
+                name=name,
             )
+            if name in self.residual_histogram:
+                figs[f"{name}-residual"] = self.plot_residual_func(
+                    self.residual_histogram[name], bin_widths=bin_widths, bin_centers=bin_centers, name=name)
             for cls_name, score in jsd.items():
                 jsd_results[f"{name}-{cls_name}"] = score
                 if name in self.reference_histogram:
@@ -479,7 +588,7 @@ class GenerationMetrics:
                     self.histogram_2d[name][class_name],
                     x_centers=bin_centers,
                     y_centers=bin_centers,
-                    title=f"2D Histogram {name} - {class_name}"
+                    title=f"{_pretty(name)} — {class_name}, validation"
                 )
                 figs[f"2D_{name}_{class_name}"] = fig
 
